@@ -1,0 +1,1030 @@
+---
+title: "ExoSpec Methods & Results"
+author: "Shea P. Connell"
+date: "04/10/2019"
+output: word_document
+---
+
+```{r setup, include=FALSE, message=FALSE}
+# Always set the random seed, even if you don't think you need it (this work definitely does!). Please note that these analyses were originally
+# performed in R Version 3.5.3 and a change was made to the sampling function in 3.6, making these results no longer
+# quantitatively reproducible. So I have added a catch to "reset" the RNG to the "old" rounding version if this
+# is knitted in >3.5.3
+RNGversion("3.5.3")
+set.seed(2903)
+# knitr setup including figure arguments (pdf figures are saved separately)
+knitr::opts_chunk$set(
+   echo = FALSE,
+   include = TRUE,
+   fig.align = "centre",
+   cache = FALSE,
+   dev = "png",
+   dpi = 450
+)
+######## LOAD LIBRARIES AND SET PARAMETERS ######## 
+#Cleaning and munging:
+library(readxl)
+library(tidyverse)
+library(magrittr)
+library(ssh)
+library(here)
+
+#Modelling & Computation
+library(glmnet)
+library(randomForest)
+library(furrr)
+library(pROC)
+library(rmda)
+library(splitstackshape)
+library(yardstick)
+
+#Making things pretty:
+library(formattable)
+library(qwraps2)
+library(ggpubr)
+library(ggsci)
+library(dabestr)
+library(cowplot)
+
+# Settings for tables to at least be printed in the .doc:
+options(qwraps2_markup = "markdown")
+# Set the parallelisation options:
+plan(multisession)
+# Set the default ggplot theme:
+theme_set(theme_cowplot())
+#' Custom' colours for the plots (they all come from the D3 palette):
+D3Red <- "#D62728FF"
+D3Orange <- "#FF7F0EFF"
+D3Blue <- "#1F77B4FF"
+D3Green <- "#2CA02CFF"
+D3Purp <- "#9467BDFF"
+
+#### DOWNLOAD DATADUMPS  ####
+# The database is dumped daily to the cancer genetics HPC drive so here we ssh into the UEA HPC. 
+# Only UEA samples in the Mass Spec data so we don't need to worry about cleaning the nightmare that is non-UEA data...
+HPC <- ssh_connect("xjz17vzu@hpc.uea.ac.uk") 
+#Download the UEA files to the local path
+scp_download(HPC,
+             "/gpfs/afm/cancergenetics/Datasets/lab_database_dumps/UEA_Lab_full_Datadump_latest.xlsx",
+             here("data/raw/"),
+             verbose = FALSE)
+ssh_disconnect(HPC)
+#### Read in and clean Clinical data 
+ClinData <- read_xlsx(here("data/raw/UEA_Lab_full_Datadump_latest.xlsx"),
+                      sheet = "clin_samples_closest_biopsy", 
+                      guess_max = 2000) %>% 
+   #Pull out the clinical variables we care about
+   select(in_house_sample_ID, 
+          category_at_initial_urine_collection, 
+          subcategory_at_initial_urine_collection,
+          age_at_enrollment, 
+          PSA_at_initial_urine_collection,
+          total_gleason_predominantly, 
+          total_gleason_less_predominantly,
+          clinical_t_at_enrollment, 
+          CAPRA_Score,
+          urine_vol_ml, 
+          DRE_size,
+          date_of_initial_urine_collection, 
+          date_of_biopsy) %>% 
+   #Rename them to be easier to work with
+   set_colnames(c("Sample_ID", 
+                  "Cat", "SubCat", 
+                  "Age", "PSA", 
+                  "MajGleason", "MinGleason",
+                  "TStage", "CAPRA",
+                  "UrineVol", "DRESize", 
+                  "UrineDate", "BxDate")) %>% 
+   #Mutate the categories and Gleasons to play nicely:
+   mutate(
+      #Change up all the high-PSA sub-types to just be a -ve Bx outcome:
+      Cat = case_when(
+         Cat == "abnormal" ~ "S",
+         SubCat %in% c("atypia","P", "S", "HG-P", "unknown") ~ "S",
+         TRUE ~ Cat),
+      #Mutate Gleason to something a bit more workable
+      Gleason = case_when(
+         MajGleason == 4 & MinGleason == 3 ~ 7.5,
+         Cat == "A" ~ 11,
+         Cat %in% c("CB", "S") ~ 0,
+         Cat == "Sx" ~ NA_real_,
+         TRUE ~ MajGleason + MinGleason),
+      #Create dates for Urine collection
+      UrineDate = lubridate::as_date(UrineDate),
+      #IMpute missing Urine volumes
+      UrineVol = if_else(is.na(UrineVol), median(UrineVol, na.rm = TRUE), UrineVol)
+   ) %>%  
+   #Remove the Major/minor gleasons
+   select(-MajGleason, - MinGleason) %>% 
+   #Create the outcomes:
+   mutate(TriSig = factor(case_when(Gleason == 0 ~ "NEC",
+                                    Gleason <= 7 ~ "LC",
+                                    Gleason >= 7.5 ~ "HC",
+                                    is.na(Gleason) & Cat == "S" ~ "NEC",
+                                    TRUE ~ "Problemo"),
+                          levels = c("NEC", "LC", "HC"),
+                          ordered = TRUE),
+          GleaSig = factor(if_else(Gleason >= 7.5, 1, 0), labels = c("No", "Yes")),
+          LowGSig = factor(if_else(Gleason >= 7, 1, 0), labels = c("No", "Yes")),
+          ClinSig = factor(if_else(Cat %in% c("I", "H", "A"), 1, 0), labels = c("No", "Yes")),
+          is_C    = factor(if_else(Cat %in% c("CB", "S"), 0, 1), labels = c("No", "Yes")),
+          is_HC   = factor(if_else(Cat %in% c("H", "A"), 1, 0), labels = c("No", "Yes")),
+          Gleason = factor(Gleason, ordered = TRUE)
+   ) %>% 
+   # Sample_ID M_88_2 has an abnormally high PSA closest to time of collection (63.8) due to an infection
+   # Instead we will impute the post-infection value of 4.1.
+   mutate(PSA = if_else(Sample_ID == "M_88_2", 4.1, PSA))
+
+#Define the variables used throughout:
+# The outcomes assessed later on (see data dictionary for formal definition):
+outcomes <- c("Cat", "TriSig", "GleaSig", "LowGSig", "ClinSig","is_C")
+# Clinical Variables:
+ClinVars <- c("PSA", "UrineVol", "DRESize", "Age")
+
+########### MASS SPEC DATA LOAD ############
+#Load the RDS object (quicker than csv) of the pre-cleaned MassSpec data
+MassSpec <- readRDS(here("output/data_out/MassSpecClean.RDS"))
+
+# We need to set a lower bounds on the number of samples a peptide is quantified in because information cannot be reliably 
+# obtained from a peptide if it is only quantified in <30% of samples. This is a standard approach.
+UniqueValues <- function(peptide) {
+   n_distinct(peptide) > (340 * 0.3)
+}
+
+#Pull out the peptides quantified in _at least_ 30% of Cancer samples:
+Cancer_Peptides <- MassSpec %>% 
+   filter(is_C == "Yes") %>% 
+   select(-outcomes, -ClinVars, -UrineDate, -BxDate, -Sample_ID) %>% 
+   #Remove probes that are quantified in <30% of samples
+   select_if(UniqueValues) %>% 
+   names
+
+#Pull out the peptides quantified in _at least_ 30% of Non-Cancer samples:
+Non_Cancer_Peptides <- MassSpec %>% 
+   filter(is_C == "No") %>% 
+   select(-outcomes, -ClinVars, -UrineDate, -BxDate, -Sample_ID) %>% 
+   #Remove probes that are quantified in <30% of samples
+   select_if(UniqueValues) %>% 
+   names
+
+#Now reduce the original MassSpec dataset to the above subsets:
+MassSpec <- MassSpec %>% 
+   select(Sample_ID, Cancer_Peptides, Non_Cancer_Peptides) %>% 
+   inner_join(ClinData, by = "Sample_ID")
+
+########### NANOSTRING DATA LOAD ############
+NanoString <- read_csv(here("data/raw/Nano167_Log2Pos_Norm.csv"),
+                       col_names = TRUE,
+                       col_types = cols(
+                          .default = col_double(),
+                          Sample_ID = col_character()
+                       )) %>% 
+   rename("ERG3 exons 4-5" = "ERG 3 ex 4-5",
+          "ERG3 exons 6-7" = "ERG3 ex 6-7",
+          TIMP4 = "Timp4")
+#Make the merged dataset that is used for the rest of the analyses:
+ExoSpec <- inner_join(NanoString, MassSpec, by = "Sample_ID") %>% 
+   select(-BxDate, -UrineDate, -CAPRA) %>% 
+   filter(Cat != "A") %>% 
+   filter(PSA < 100) 
+
+ExoSpecMets <- inner_join(NanoString, MassSpec, by = "Sample_ID") %>% 
+   select(-BxDate, -UrineDate, -CAPRA) %>% 
+   filter(Cat == "A" | PSA >= 100) 
+
+#Name the variables we will use for comparators later:
+NanoGenes <- names(NanoString)[1:167]
+#Grab the names of all the peptides...
+Peptides <- c(Cancer_Peptides, Non_Cancer_Peptides)
+```
+
+
+
+```{r Model constuction}
+# With all data loaded, cleaned and processed we can begin the analyses:
+## Make a helper function to build the LASSO-based comparators
+LASSO_helper <- function(Variables, 
+                         Dataframe,
+                         TrainingLabel,
+                         ModelName = "RiskScore",
+                         seed = 2903){
+   #Setting the seed here ensures all comparators get the same random starts for regression etc so the 
+   # only thing different is the variables included.
+   set.seed(seed)
+   #glmnet only works with matrix objects:
+   model_df = as.matrix(Dataframe[, Variables])
+   #fit A 20-fold CV glmnet and keep the out-of-fold results:
+   LASSO = cv.glmnet(x = model_df,
+                     y = TrainingLabel,
+                     keep = TRUE,
+                     nfolds = 20)
+   #pick the lambda that results in the best fitted metrics (1 standard error from the min):
+   the_chosen_one = which(LASSO$lambda == LASSO$lambda.1se)
+   #Generate the out-of-fold predictions for the chosen lambda and format it nicely into a full dataframe:
+   results = LASSO$fit.preval[, the_chosen_one] %>% 
+      enframe(name = NULL) %>% 
+      mutate(value = value * 0.5) %>% 
+      set_names(ModelName) %>% 
+      bind_cols(Dataframe)
+   #Pull out the coefficients for each model:
+   Coefs <- coef.cv.glmnet(LASSO,
+                           s = "lambda.1se") %>%
+      as.matrix %>% 
+      as_tibble %>% 
+      set_names("Coef") %>% 
+      mutate(Vars = c("Intercept", Variables)) %>%
+      filter(Coef != 0) %>% 
+      filter(Vars != "Intercept")
+   #Finally return the LASSO, fitted over the whole dataset and the Results dataframe:
+   return(list(Model = LASSO,
+               Results = results,
+               Coefs = Coefs))
+}
+
+# Make a nice list of variables to be fed into the LASSO function:
+Comparator_Variables <- list(
+   SoC = c("PSA", "Age"),
+   MassSpec = Peptides,
+   NanoString = NanoGenes,
+   ExoSpec = c(c("PSA", "Age"), Peptides, NanoGenes)
+)
+
+# Produce all the models, results and coefficients:
+AllModels <- map(Comparator_Variables, function(RobustVariables){
+   LASSO_helper(Variables = RobustVariables, 
+                Dataframe = ExoSpec, 
+                TrainingLabel = as.numeric(ExoSpec$TriSig) - 1)
+}) %>% 
+   set_names(c("SoC", "MassSpec", "NanoString", "ExoSpec"))
+
+ConfirmedVariables <- map(AllModels, function(Comparator){
+   Comparator$Coefs %>% 
+      as.data.frame()
+})
+
+# ExoSpecMets <- ExoSpecMets %>%
+#    select(-Sample_ID, -Cat, -SubCat, -TStage, -DRESize) %>% 
+#    select(ConfirmedVariables$ExoSpec$Vars)
+# 
+# MetsPredictions <- predict(AllModels$ExoSpec$Model, 
+#                            newx = data.matrix(ExoSpecMets))
+```
+
+
+
+```{r RF attempts}
+#Can we "fix" the weird distributions by just flinging everything at a random forest with pre-selected features (bad practice)? 
+RFModelHelper <- function(Variables,
+                          Dataframe = ExoSpec,
+                          # Use the continuous version of the TriSig label:
+                          TrainingLabel = as.numeric(ExoSpec$TriSig) - 1,
+                          ModelName = "RiskScore",
+                          seed = 2903) {
+   set.seed(seed)
+   # Train the RF model (suppress the warning because less than 5 response levels
+   # in a regression makes it suggest classification)
+   model <- suppressWarnings(
+      randomForest::randomForest(Dataframe[, Variables],
+                                 y = TrainingLabel,
+                                 ntree = 301,
+                                 replace = FALSE
+      )
+   )
+   # Return out-of-bag results from said RF model:
+   results <- predict(model, type = "response") %>%
+      # Bind as a dataframe
+      as.data.frame() %>%
+      # set the name of the risk score:
+      set_names(ModelName) %>%
+      # The range of TriSig is [0,2] so halving it gives a nicer number to work with:
+      mutate(RiskScore = RiskScore * 0.5) %>%
+      # Bind the columns of the dataframe:
+      bind_cols(Dataframe)
+   # Return the model & results as a list
+   return(list(
+      Model = model,
+      Results = results
+   ))
+}
+#### Train each comparator models ####
+# Map through each of the comparator choices and produce a model.
+AllModels <- map(ConfirmedVariables, function(comparator){
+   RFModelHelper(Variables = comparator$Vars)}) %>%
+   set_names(c("SoC", "MassSpec", "ExoRNA", "ExoSpec"))
+
+ExoSpecMets <- ExoSpecMets %>%
+   select(-Sample_ID, -Cat, -SubCat, -TStage, -DRESize) %>%
+   select(ConfirmedVariables$ExoSpec$Vars)
+
+MetsPredictions <- predict(AllModels$ExoSpec$Model,
+                           newdata = ExoSpecMets[, ConfirmedVariables$ExoSpec$Vars])
+```
+
+# Introduction
+
+This is placeholder text for the introduction - depending on journal this may be considered copyrighted.
+
+# Methods 
+### Patient population and characteristics
+### Sample Processing and analysis
+### Statistical Analysis
+
+*A priori* filtering of peptides was undertaken by only retaining peptides quantified in at least 30% of either cancer or non-cancer samples.
+
+# Results
+
+**Table 1.** *Characteristics of the ExoSpec development cohort.*
+```{r Cohort characteristics, results='asis'}
+# Produce a table (that unfortunately needs editing outside of R because of the wonders of Word .doc format)
+ExoSpec %>%
+   # order the Lab and DRE size factor for the table
+   mutate(
+      "Collection Centre:" = if_else(str_detect(Sample_ID, "M_"), "NNUH, n (%)", "SJH, n (%)"),
+      "Age:" = Age,
+      "PSA:" = PSA,
+      "Prostate Size (DRE Estimate):" = factor(DRESize,
+                                               levels = c("small", "medium", "large", "unknown"),
+                                               labels = c("Small, n (%)", "Medium, n (%)", "Large, n (%)", "Unknown, n (%)"),
+                                               ordered = TRUE
+      ),
+      # For some reason this doesn't actually order them in the final table...
+      "Gleason Score:" = factor(case_when(
+         Gleason == 0 ~ "0, n (%)",
+         Gleason == 6 ~ "6, n (%)",
+         Gleason == 7 ~ "3+4, n (%)",
+         Gleason == 7.5 ~ "4+3, n (%)",
+         Gleason %in% c(8, 9, 10) ~ "\u2265 8, n (%)"
+      ),
+      levels = c("0, n (%)", "6, n (%)", "3+4, n (%)", "4+3, n (%)", "\u2265 8, n (%)"),
+      ordered = TRUE
+      ),
+      Biopsy_Result = if_else(is_C == "Yes", "Biopsy Positive", "Biopsy Negative")
+   ) %>%
+   # Select the variables we want to summarise across the labs
+   select("Collection Centre:", "Age:", "PSA:", "Prostate Size (DRE Estimate):", "Gleason Score:", Biopsy_Result) %>%
+   group_by(Biopsy_Result) %>%
+   summary_table() %>%
+   print(markup = "markdown", cnames = c("Biopsy Negative:", "Biopsy Positive"))
+```
+
+
+```{r Features selected}
+
+# Map through the uneven list, adding blank rows to make it all even for a table:
+#We can play about with this as a table to make it nicer in Word...
+SelectedFeatures <- map_dfc(ConfirmedVariables, function(variables) {
+   
+   rowsAdded = max(map_dbl(ConfirmedVariables, nrow)) - nrow(variables)
+   
+   NiceTable = tibble(
+      Variables = c(variables$Vars, rep("", rowsAdded)),
+      Coefficients = c(round(variables$Coef, 6), rep("", rowsAdded))
+   )
+}) 
+
+
+colnames(SelectedFeatures) <- c("SoC Variables", "SoC Coefficients", 
+                                "MassSpec Variables", "MassSpec Coefficients",
+                                "ExoRNA Variables", "ExoRNA Coefficients", 
+                                "ExoSpec Variables", "ExoSpec Coefficients")
+
+format_table(SelectedFeatures, format = "markdown")
+```
+
+### ExoSpec predictive ability
+
+```{r Waterfall histogram}
+
+# Take the results dataframe and make a density plot that is filled according to a chosen label
+Waterfall_Plot <- AllModels$ExoSpec$Results %>%
+   mutate(GroupedGleason = factor(
+      case_when(
+         Gleason == 0 ~ "No Evidence of Cancer",
+         Gleason == 6 ~ "Gleason = 6",
+         Gleason == 7 ~ "Gleason = 3+4",
+         Gleason %in% c(7.5, 8, 9, 10) ~ "Gleason \u22654+3"
+      ),
+      levels = c("No Evidence of Cancer", "Gleason = 6", "Gleason = 3+4", "Gleason \u22654+3"),
+      ordered = TRUE
+   )) %>%
+   ggplot(aes(x = fct_reorder(Sample_ID, RiskScore), y = RiskScore, fill = GroupedGleason)) +
+   geom_bar(stat = "identity") +
+   theme_cowplot() +
+   theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      legend.position = "bottom",
+      legend.justification = "center"
+   ) +
+   labs(
+      x = "Patient Biopsy",
+      y = "ExoSpec Risk Signature",
+      fill = "Biopsy Outcome"
+   ) +
+   scale_fill_manual(values = c("#2CA02CFF", "#1F77B4FF", "#FF7F0EFF", "#D62728FF"))
+
+#### Calculate Odds ratios
+# This uses the MASS package and polr to get the odds ratio for a "unit" change in ExoSpec compared to Gleason outcome (sub-optimal - assumes linearity and continuous outcome really...).
+ExoSpec_clm <- AllModels$ExoSpec$Results %>%
+   mutate(
+      RiskScore = RiskScore * 10,
+      Gleason = factor(Gleason,
+                       levels = c(0, 6, 7, 7.5, 8, 9, 10, 11),
+                       ordered = TRUE
+      )
+   ) %>%
+   MASS::polr(Gleason ~ RiskScore, data = ., Hess = TRUE)
+
+# Ordinal logistic regression returns coefficients scaled in terms of logs and are awkward to interpret.
+# Exponentiating them gives us the odds ratio for a "unit" (0.1) change in Risk Score.
+# Here we manipulate the output to give a nice string we can use in-line.
+OddsRatio <- suppressMessages(paste0(
+   "Proportional odds ratio = ",
+   round(exp(coef(ExoSpec_clm)), 2),
+   " per 0.1 ExoSpec increase, 95% CI: ",
+   round(exp(confint(ExoSpec_clm)[[1]]), 2),
+   " - ",
+   round(exp(confint(ExoSpec_clm)[[2]]), 2)
+))
+
+### Metrics referred to in-line:
+
+# Grab the ExoSpec score that grabs 95% of G7 patients:
+HighRiskConfInt <- AllModels$ExoSpec$Results %>%
+   filter(LowGSig == "Yes") %>%
+   summarise(Conf = round(quantile(RiskScore, 0.05), 3))
+
+# Find the SoC model score that gets 90% of G7 right
+SoC_Conf_intervals <- AllModels[["SoC"]][["Results"]] %>%
+   filter(LowGSig == "Yes") %>%
+   summarise(Conf = round(quantile(RiskScore, 0.1), 3))
+
+# Now find the number of patients the SoC model would misclassify at that score:
+SoC_Misclassify <- AllModels[["SoC"]][["Results"]] %>%
+   filter(LowGSig == "No") %>%
+   tally(RiskScore >= SoC_Conf_intervals$Conf) /
+   nrow(AllModels[["SoC"]][["Results"]] %>% filter(LowGSig == "No"))
+```
+
+As ExoSpec Risk Score (range 0-1) increased, the likelihood of high-grade disease being detected on biopsy was significantly greater (`r OddsRatio`; ordinal logistic regression, **Figure 2**). 
+
+**Table 2.** *AUC of all trained models for detecting outcomes of an initial biopsy for varying clinically significant thresholds. Brackets show 95% confidence intervals of the AUC, calculated from 1,000 stratified bootstrap resamples. Input variables for each model are detailed in Table 1.*
+```{r model AUCs}
+# Create another helper function that can grab the AUCs for a variety of (binary) outcomes@
+get_aucs <- function(ResultDF, RiskScore = "RiskScore",
+                     test_labels = c("GleaSig", "LowGSig", "is_C")) {
+   # Map through the labels, returning a vector of AUCs, rounded to 2decimal places:
+   future_map_chr(test_labels, function(label) {
+      tmp <- roc(ResultDF[[label]],
+                 ResultDF[[RiskScore]],
+                 ci = TRUE,
+                 ci.method = "boot",
+                 of = "auc",
+                 progress = "none",
+                 boot.n = 1000,
+                 levels = c("No", "Yes"),
+                 direction = "<"
+      )
+      # Glue together the AUC, and the 95% CI for each measure:
+      paste0(
+         sprintf("%.2f", round(tmp[["auc"]][[1]], 2)),
+         " (",
+         sprintf("%.2f", round(tmp[["ci"]][["2.5%"]], 2)),
+         " - ",
+         sprintf("%.2f", round(tmp[["ci"]][["97.5%"]], 2)),
+         ")"
+      )
+   })
+}
+# Generate a dataframe of the AUCs for each model and outcome so that it can be pulled out for inline use below:
+AUC_Table <- bind_cols(
+   tibble(Outcome = c(
+      "Gleason \u22654+3:",
+      "Gleason \u22653+4:",
+      "Any Cancer"
+   )),
+   map_df(AllModels, function(model) {
+      get_aucs(model$Results)
+   })
+) %>%
+   set_colnames(c("Initial biopsy outcome:", "SoC", "MassSpec", "ExoRNA", "ExoSpec"))
+# Print the AUC table
+AUC_Table %>%
+   formattable(align = c("l", "r", "r", "r", "r")) %>%
+   format_table(format = "markdown")
+
+# Write a bunch of code to pull out some ROC p-values...
+ExoSpecROCs <- map(c("LowGSig", "GleaSig", "is_C"), function(outcome){
+   roc(AllModels$ExoSpec$Results[[outcome]], 
+       AllModels$ExoSpec$Results$RiskScore, 
+       ci = TRUE,
+       ci.method = "boot",
+       of = "auc",
+       progress = "none",
+       levels = c("No", "Yes"),
+       direction = "<")
+}) %>% 
+   set_names(c("LowGSig", "GleaSig", "is_C"))
+
+SoCROCs <- map(c("LowGSig", "GleaSig", "is_C"), function(outcome){
+   roc(AllModels$ExoSpec$Results[[outcome]], 
+       AllModels$SoC$Results$RiskScore, 
+       ci = TRUE,
+       ci.method = "boot",
+       of = "auc",
+       progress = "none",
+       levels = c("No", "Yes"),
+       direction = "<")
+}) %>% 
+   set_names(c("LowGSig", "GleaSig", "is_C"))
+
+LowGBoot <- roc.test(ExoSpecROCs[["LowGSig"]], SoCROCs[["LowGSig"]], 
+                     method = "bootstrap", 
+                     progress = "none",
+                     alternative = "greater", 
+                     boot.n = 1000)
+
+CancerBoot <- roc.test(ExoSpecROCs[["is_C"]], SoCROCs[["is_C"]], 
+                       method = "bootstrap", 
+                       progress = "none",
+                       alternative = "greater", 
+                       boot.n = 1000)
+
+GleaSigBoot <- roc.test(ExoSpecROCs[["GleaSig"]], SoCROCs[["GleaSig"]], 
+                        method = "bootstrap", 
+                        progress = "none",
+                        alternative = "greater", 
+                        boot.n = 1000)
+
+```
+
+ExoSpec was superior to the standard of care model for predicting Gleason ≥3+4, returning an AUC of `r str_replace(AUC_Table$ExoSpec[2], "\\(", "\\(95% CI: ")`, *p* = `r round(LowGBoot$p.value, 3)` but was not significantly better than standards of care in predicting Gleason ≥4+3 disease (`r str_replace(AUC_Table$ExoSpec[1], "\\(", "\\(95% CI: ")` *p* = `r round(GleaSigBoot$p.value, 3)`, **Table 3**).
+
+```{r Model Density plots, echo=FALSE,message=FALSE}
+# Make a decent helper function to plot out the predictions for a given model as a density:
+Density_Plots <- function(ResultDF, 
+                          RiskScore = "RiskScore", 
+                          xlab_title = "Risk Signature",
+                          fill_col,
+                          fill_col_label,
+                          case_control = ">") {
+   #Take the results dataframe and make a density plot that is filled according to a chosen label
+   ResultDF %>% 
+      ggplot(aes_string(x = RiskScore, fill = fill_col)) +
+      geom_density(alpha = 0.67) +
+      labs(fill = fill_col_label,
+           #Also calculate the AUCs for a variety of outcomes. Not strictly needed but looks nice:
+           caption = paste0("Model AUCs for determining:",
+                            "\n\u2022 Gleason \u22654+3: ", 
+                            round(roc_auc(data = ResultDF,
+                                          GleaSig, RiskScore, 
+                                          options = list(direction = case_control))$.estimate, 2),
+                            "    \u2022 Gleason \u22653+4: ", 
+                            round(roc_auc(data = ResultDF, 
+                                          LowGSig, RiskScore, 
+                                          options = list(direction = case_control))$.estimate, 2),
+                            "    \u2022 Any cancer: ", 
+                            round(roc_auc(data = ResultDF, 
+                                          is_C, RiskScore, 
+                                          options = list(direction = case_control))$.estimate, 2)),
+           x = xlab_title,
+           y = "Density") +
+      theme_pubr() +
+      scale_fill_d3() +
+      theme(plot.caption = element_text(hjust = 0, size = 14),
+            legend.justification = c(1,0))
+}
+# Loop through the model builds and produce a density plot for each.
+GleasonModelPlots <- map2(AllModels, 
+                          c("SoC", "MassSpec", "ExoRNA", "ExoSpec"),
+                          function(ModelResult, title){
+                             ModelResult$Results <-  ModelResult$Results %>% 
+                                mutate(GleasonCat = factor(
+                                   case_when(
+                                      Gleason == 0 ~ "NEC",
+                                      Gleason == 6 ~ "Gleason = 6",
+                                      Gleason == 7 ~ "Gleason = 3+4",
+                                      Gleason %in% c(7.5, 8, 9, 10) ~ "Gleason \u22654+3"),
+                                   levels = c("NEC", "Gleason = 6", "Gleason = 3+4", "Gleason \u22654+3"),
+                                   ordered = TRUE))
+                             suppressMessages(Density_Plots(ModelResult$Results, 
+                                                            RiskScore = "RiskScore", 
+                                                            fill_col = "GleasonCat", 
+                                                            fill_col_label = "Initial biopsy outcome:", 
+                                                            xlab_title = paste0(title, " model risk score")) +
+                                                 scale_fill_manual(values = c(D3Green, D3Blue, D3Orange, D3Red)))
+                          })
+```
+
+
+```{r DABEST Estimation Analysis}
+EstimationData <- suppressWarnings(
+   AllModels$ExoSpec$Results %>%
+      select(RiskScore, outcomes, Gleason) %>%
+      gather(key = "RiskScore", value = "Value", -outcomes, -Gleason) %>%
+      mutate(Category = factor(Cat, 
+                               levels = c("H", "I", "L", "S", "CB"), 
+                               labels = c("H", "I", "L", "Raised PSA", "NEC"),
+                               ordered = TRUE),
+             ModdedGleason = case_when(
+                Gleason == 0 & Category == "NEC" ~ "NEC",
+                Gleason == 0 & Category == "Raised PSA" ~ "Raised PSA",
+                Gleason == 6 ~ "Gleason = 6",
+                Gleason == 7 ~ "Gleason = 3+4",
+                Gleason %in% c(7.5, 8, 9, 10) ~ "Gleason \u22654+3"),
+             Colour = case_when(
+                ModdedGleason == "NEC" ~ D3Green,
+                ModdedGleason == "RaisedPSA" ~ D3Purp,
+                ModdedGleason == "Gleason = 6" ~ D3Blue,
+                ModdedGleason == "Gleason = 3+4" ~ D3Orange,
+                ModdedGleason == "Gleason \u22654+3" ~ D3Red)
+      ) %>%
+      filter(RiskScore == "RiskScore") %>%
+      dabest(x = ModdedGleason,
+             y = Value,
+             idx = c("NEC", "Raised PSA", "Gleason = 6", "Gleason = 3+4", "Gleason \u22654+3"),
+             reps = 1000))
+
+# Bootstrap_Results <- EstimationData[["result"]]$bootstraps %>% 
+#   bind_cols() %>% 
+#   set_colnames(c("G6", "G7", "G7.5"))
+
+EstimationSummary <- EstimationData$result %>% 
+   group_by(test_group) %>% 
+   summarise(Text = 
+                paste0(
+                   round(difference, 2),
+                   " (95% CI: ", 
+                   round(bca_ci_low, 2), 
+                   " - ", 
+                   round(bca_ci_high, 2),
+                   ")"))
+
+
+```
+
+Resampling of ExoSpec predictions via estimation plots allowed for comparisons of mean ExoSpec signatures between groups by 1,000 bias-corrected and accelerated bootstrap resamples (**Figure 4**). The mean ExoSpec differences between patients with no evidence of cancer on biopsy were: Gleason 6 = `r EstimationSummary$Text[2]`, Gleason 3+4 = `r EstimationSummary$Text[1]` and Gleason ≥4+3 = `r EstimationSummary$Text[3]`. Interestingly, patients with no evidence of cancer had a lower ExoSpec risk score (mean difference = `r EstimationSummary$Text[4]`) than those men with a raised PSA but negative for cancer on biopsy (**Supplementary Figure 5**).
+
+```{r DCA}
+# Set the parameters for resampling:
+set.seed(2903)
+### THIS HAS BEEN SET AT 100 FOR EASE OF BINDER COMPUTATION ###
+# It can be set back to 1000 to get the *exact* figures supplied in the manuscript
+iterations <- 1000
+sample_size <- nrow(ExoSpec)
+
+# Need to set up the data a bit to conform by removing the CB men (they don't get biopsies):
+DCA_Data <- map(AllModels, function(df) {
+   df$Results %>%
+      filter(PSA >= 4) %>%
+      dplyr::select(
+         RiskScore, Cat, Gleason, Sample_ID,
+         outcomes
+      ) %>%
+      mutate(
+         GleasonFactor = factor(
+            case_when(
+               Gleason == 0 ~ "0",
+               Gleason == 6 ~ "6",
+               Gleason %in% c(7, 7.5) ~ "7",
+               Gleason %in% c(8, 9, 10) ~ "8"
+            ),
+            ordered = TRUE
+         ),
+         # The rmda package for DCA requires numeric binary variables (bad idea I know), rather than the levels.
+         LowGSig = as.numeric(LowGSig) - 1,
+         GleaSig = as.numeric(GleaSig) - 1,
+         is_C = as.numeric(is_C) - 1
+      )
+})
+
+# Set the rates reported by Martin et al (2018) in the CAP trial. Multiplying by the sample size gives the number of rows to sample. This can be set to match the proportions seen in _your_ population of interest.
+proportions <- list(
+   "0" = 0.6061 * sample_size, # HighPSA NegativeBx
+   "6" = 0.2718 * sample_size, # G6
+   "7" = 0.0709 * sample_size, # G7
+   "8" = 0.0512 * sample_size
+) # G8
+
+# Loop through each comparator and generate the resampled dataframes:
+DCA_Resamples <- map(DCA_Data, function(df) {
+   # ensure each comparator has the same resamples:
+   set.seed(2903)
+   map(seq_len(iterations), function(x) {
+      splitstackshape::stratified(
+         indt = df,
+         group = "GleasonFactor",
+         size = proportions,
+         replace = TRUE
+      )
+   })
+})
+# Create a list of formula objects so they can be mapped through for DCA:
+outcome_formulas <- list(
+   GleaSig = as.formula(GleaSig ~ RiskScore),
+   LowGSig = as.formula(LowGSig ~ RiskScore),
+   is_C = as.formula(is_C ~ RiskScore)
+)
+
+# This is a messy one; map through the outcomes above, calculating the net benefit for each iteration and then
+# formatting nicely:
+DCA_Results <-
+   # For each outcome:
+   future_map(outcome_formulas, function(outcome) {
+      # and for each comparator model
+      map2(DCA_Resamples, names(DCA_Resamples), function(comparator, comp_names) {
+         # loop through the iterations
+         map_dfc(comparator, function(iteration) {
+            # generate a decision curve and pull out the net benny:
+            suppressWarnings(decision_curve(outcome,
+                                            data = iteration,
+                                            fitted.risk = FALSE,
+                                            confidence.intervals = NA
+            ))$derived.data %>%
+               select(sNB)
+         }) %>%
+            # Remove the NA's, calculate the mean over all iterations
+            na.omit() %>%
+            rowMeans() %>%
+            tibble() %>%
+            mutate(Model = rep(c("RiskScore", "All", "None"), each = 100))
+      }) # Add in the names of the different "versions"
+   })
+```
+
+```{r DCA plot production}
+# Now we can go through the generate results and tidy them up in a nice loop for plotting:
+# For each outcome (GleaSig LowGSig etc)
+DCA_Plot_Data <- map(DCA_Results, function(outcome) {
+   # Map through each outcome and model:
+   map2(outcome, c("SoC", "MassSpec", "ExoRNA", "ExoSpec"), function(Comparator, outnames) {
+      # Create a new tibble with a threshold and the net benefit for treating all/none (0)
+      tibble(
+         Threshold = seq(0, 0.99, by = 0.01),
+         All = filter(Comparator, Model == "All")$.,
+         None = 0,
+         RiskModel = filter(Comparator, Model == "RiskScore")$.
+      ) %>%
+         set_colnames(c("Threshold", "All", "None", outnames)) %>%
+         gather(value = "Net_Benefit",
+                key = "Comparator",
+                -Threshold)
+   }) %>%
+      bind_rows() %>%
+      # remove the duplicate values for the All and None lines:
+      distinct() %>%
+      mutate(Comparator = factor(Comparator,
+                                 levels = c("All", "None",
+                                            "SoC", "MassSpec", "ExoRNA", "ExoSpec"),
+                                 ordered = TRUE))
+})
+
+DCA_SoC_Relative <- map(DCA_Plot_Data, function(OutcomeDCA){
+   OutcomeDCA %>% 
+      pivot_wider(names_from = Comparator,
+                  values_from = Net_Benefit) %>% 
+      mutate(MassSpec = MassSpec - SoC,
+             ExoRNA = ExoRNA - SoC,
+             ExoSpec = ExoSpec - SoC) %>% 
+      select(-SoC, -All) %>% 
+      pivot_longer(cols = None:ExoSpec,
+                   names_to = "Comparator",
+                   values_to = "Net_Benefit") %>% 
+      mutate(Comparator = factor(Comparator, 
+                                 levels = c("None", "MassSpec", "ExoRNA", "ExoSpec"),
+                                 ordered = TRUE))
+})
+
+DCAPlots <- map2(
+   DCA_SoC_Relative, c("any prostate cancer",
+                       "Gleason \u22653+4",
+                       "Gleason \u22654+3"),
+   function(outcome, outcome_name) {
+      ggplot(outcome, aes(x = Threshold, colour = Comparator, y = Net_Benefit)) +
+         geom_line(size = 1.07) +
+         theme_cowplot() +
+         coord_cartesian(ylim = c(-0.05, 0.5), xlim = c(0, 0.6)) +
+         labs(x = paste0("Decision threshold for detection of ", outcome_name),
+              y = "Standardised Net Benefit\nrelative to Standard of Care",
+              colour = "Comparators") +
+         scale_color_manual(values = c(D3Orange, D3Green, D3Purp, D3Red),
+                            labels = c("Standard of Care", "MassSpec", "ExoRNA", "ExoSpec")) +
+         theme(
+            legend.text = element_text(size = 24),
+            legend.title = element_text(size = 24),
+            legend.justification = "center"
+         ) +
+         guides(colour = guide_legend(
+            override.aes = list(size = 6),
+            keyheight = 0.5,
+            keywidth = 0.1,
+            default.unit = "inch"
+         ))
+   }
+)
+DCAPlots <- list(DCAPlots[[1]] + theme(legend.position = "none"),
+                 DCAPlots[[2]] + theme(legend.position = "none"),
+                 DCAPlots[[3]] + theme(legend.position = "none"),
+                 Legend = get_legend(DCAPlots[[1]])
+)
+```
+
+# Figures 
+```{r Waterfall_plot, fig.height=6, fig.width=9}
+Waterfall_Plot
+ggsave(Waterfall_Plot,
+       filename = here("output/fig_out/Figure 1 (Waterfall).pdf"),
+       height = 6, width = 9, units = "in",
+       device = cairo_pdf
+)
+```
+
+**Figure 1.** _Waterfall plot of the ExoSpec risk score for each patient. Each coloured bar represents an individual patient’s calculated risk score and their true biopsy outcome, coloured according to Gleason score (Gs) . Green - No evidence of cancer, Blue – Gs 6, Orange - Gs 3+4, Red - Gs ≥ 4+3._
+
+#####
+
+```{r Density_plots, fig.height=9, fig.width=13}
+ggarrange(
+   plotlist = GleasonModelPlots,
+   common.legend = TRUE,
+   labels = "AUTO",
+   font.label = 28,
+   legend = "bottom",
+   ncol = 2,
+   nrow = 2
+)
+ggsave(
+   filename = here("output/fig_out/Figure 2 (Density).pdf"),
+   height = 9, width = 13, units = "in",
+   device = cairo_pdf
+)
+```
+
+**Figure 2.** _Density plots detailing risk score distributions generated from four trained models. Models A to D were trained with different input variables; **A** - SoC clinical risk model, including Age and PSA, **B** - MassSpec model, **C** -ExoRNA model and **D** - ExoSpec model, combining the predictors from all three previous models. The full list of variables in each model is available in Table 1. Fill colour shows the risk score distribution of patients with a significant biopsy outcome of Gs ≥ 3+4 (Orange) or Gs ≤ 6 (Blue)._
+
+#####
+
+```{r Estimation_plots, fig.height=6, fig.width=9}
+plot(EstimationData,
+     theme = theme_cowplot, palette = "Dark2",
+     rawplot.markersize = 3,
+     axes.title.fontsize	= 12,
+     group.summaries = "mean_sd",
+     rawplot.ylabel = "ExoSpec\n Risk Signature",
+     effsize.ylabel = "Mean ExoSpec Risk Signature\ndifference from NEC samples",
+     effsize.markersize = 4)
+ggsave(
+   filename = here("output/fig_out/Figure 3 (Estimation).pdf"),
+   height = 6, width = 9, units = "in",
+   device = cairo_pdf
+)
+```
+
+**Figure 3.** *Cumming estimation plot of the ExoSpec risk signature. The top row details individual patients as points, separated according to Gleason score on the x-axis and risk score on the y-axis. Points are coloured according to clinical risk category; NEC - No evidence of cancer, Raised PSA - Raised PSA with negative biopsy, L -D’Amico Low-Risk, I - D’Amico Intermediate Risk, H - D’Amico High-Risk. Gapped vertical lines detail the mean and standard deviation of each group’s risk scores. The lower panel shows the mean differences in risk score of each group, as compared to the NEC samples. Mean differences and 95% confidence interval are displayed as a point estimate and vertical bar respectively, using the sample density distributions calculated from a bias-corrected and accelerated bootstrap analysis from 1,000 resamples.*
+
+##### 
+
+```{r DCA plots, fig.height=10, fig.width=13}
+ggarrange(
+   plotlist = DCAPlots,
+   labels = c("A", "B", "C", ""),
+   font.label = 32,
+   ncol = 2,
+   nrow = 2
+)
+ggsave(
+   filename = here("output/fig_out/Figure 4 (DCA).pdf"),
+   height = 10, width = 13, units = "in",
+   device = cairo_pdf
+)
+```
+
+**Figure 4.** _Decision curve analysis (DCA) plots detailing the standardised net benefit (sNB) of adopting different risk models, relative to standard of care The x-axis details the range of risk a clinician, patient or interdisciplinary team may accept before deciding to undertake biopsy. Panels show the relative sNB based upon the detection of varying levels of disease severity: **A** - detection of any cancer , **B** - detection of Gleason ≥ 3+4, **C** - detection of Gleason ≥ 4+3; **Orange** - biopsy patients according to current standards of care, **Green** - biopsy patients based on the MassSpec model, **Purple** - biopsy patients based on the ExoRNA model, **Red** - biopsy patients based on a the ExoSpec model. To assess the benefit of adopting these risk models in a non-PSA screened population we used data available from the control arm of the CAP study [@Martin2018]. DCA curves were calculated from 1,000 bootstrap resamples of the available data to match the distribution of disease reported in the CAP trial population. Mean sNB from these resampled DCA results were calculated and the SoC model results used as the baseline benefit. Results are plotted relative to this SoC benefit. See Methods for full details._
+
+#####
+
+```{r Biopsy Reductions, fig.height=10, fig.width=13}
+######## BIOPSY REDUCTION CALCULATIONS ########
+# Calculated according to:
+DCA_Results <-
+   # For each outcome:
+   future_map(outcome_formulas, function(outcome) {
+      # and for each comparator model
+      map2(DCA_Resamples, names(DCA_Resamples), function(comparator, comp_names) {
+         # loop through the iterations
+         map_dfc(comparator, function(iteration) {
+            # generate a decision curve and pull out the net benny:
+            suppressWarnings(decision_curve(outcome,
+                                            data = iteration,
+                                            fitted.risk = FALSE,
+                                            confidence.intervals = NA
+            ))$derived.data %>%
+               select(NB)
+         }) %>%
+            # Remove the NA's, calculate the mean over all iterations
+            na.omit() %>%
+            rowMeans() %>%
+            tibble() %>%
+            mutate(Model = rep(c("RiskScore", "All", "None"), each = 100))
+      }) # Add in the names of the different "versions"
+   })
+
+
+# Now we can go through the generate results and tidy them up in a nice loop for plotting:
+
+DCA_Plot_Data <- map(DCA_Results, function(outcome) {
+   map2(outcome, c("SoC", "MassSpec", "ExoRNA", "ExoSpec"), function(Comparator, outnames) {
+      tibble(
+         Threshold = seq(0, 0.99, by = 0.01),
+         All = filter(Comparator, Model == "All")$.,
+         None = 0,
+         RiskModel = filter(Comparator, Model == "RiskScore")$.
+      ) %>%
+         set_colnames(c("Threshold", "All", "None", outnames)) %>%
+         gather(
+            value = "Net_Benefit", key = "Comparator",
+            -Threshold
+         )
+   }) %>%
+      bind_rows() %>%
+      # remove the duplicate values for the All and None lines:
+      distinct() %>%
+      mutate(Comparator = factor(Comparator,
+                                 levels = c(
+                                    "All", "None",
+                                    "SoC", "MassSpec", "ExoRNA", "ExoSpec"
+                                 ),
+                                 ordered = TRUE
+      ))
+})
+
+Reduction <- map2(
+   DCA_Plot_Data, c("any prostate cancer",
+                    "Gleason \u22654+3",
+                    "Gleason \u22653+4"),
+   function(outcome, outcome_name) {
+      outcome %>%
+         spread(value = "Net_Benefit", key = "Comparator") %>%
+         mutate(
+            MassSpecReduction = (MassSpec - SoC) * 100 / (Threshold / (1 - Threshold)),
+            ExoRNAReduction = (ExoRNA - SoC) * 100 / (Threshold / (1 - Threshold)),
+            ExoSpecReduction = (ExoSpec - SoC) * 100 / (Threshold / (1 - Threshold))
+         ) %>%
+         select(Threshold, MassSpecReduction:ExoSpecReduction) %>%
+         gather(key = "Comparator", value = "Net_Benefit", -Threshold) %>%
+         mutate(Net_Benefit = if_else(is.na(Net_Benefit), 0, Net_Benefit)) %>%
+         mutate(Comparator = factor(Comparator,
+                                    levels = c("MassSpecReduction", "ExoRNAReduction", "ExoSpecReduction"),
+                                    ordered = TRUE)) %>% 
+         ggplot(aes(x = Threshold, y = Net_Benefit, colour = Comparator)) +
+         geom_line(size = 1.07) +
+         geom_hline(yintercept = 0) +
+         theme_cowplot() +
+         coord_cartesian(xlim = c(0, 0.6)) +
+         scale_color_manual(
+            labels = c("MassSpec", "ExoRNA", "ExoSpec"),
+            values = c(D3Green, D3Purp, D3Red)
+         ) +
+         labs(
+            x = paste0("Decision threshold for detection of ", outcome_name),
+            y = "Net percentage reduction in biopsies\nrelative to standard of care",
+            colour = "Comparators"
+         ) +
+         scale_x_continuous(breaks = seq(0, 0.6, 0.1)) +
+         scale_y_continuous(breaks = seq(0, 100, 10)) +
+         theme(
+            legend.text = element_text(size = 24),
+            legend.title = element_text(size = 24),
+            legend.justification = "center"
+         ) +
+         guides(colour = guide_legend(
+            override.aes = list(size = 6),
+            keyheight = 0.5,
+            keywidth = 0.1,
+            default.unit = "inch"
+         ))
+   }
+)
+
+Reduction <- list(Reduction[[1]] + theme(legend.position = "none"),
+                  Reduction[[2]] + theme(legend.position = "none"),
+                  Reduction[[3]] + theme(legend.position = "none"),
+                  Legend = get_legend(Reduction[[1]])
+)
+
+ggarrange(
+   plotlist = Reduction,
+   labels = c("A", "B", "C", ""),
+   font.label = 32,
+   ncol = 2,
+   nrow = 2
+)
+
+ggsave(
+   filename = here("output/fig_out/Figure 5 (Reduction).pdf"),
+   height = 10, width = 13, units = "in",
+   device = cairo_pdf
+)
+```
+
+**Figure 5.** _Net percentage reduction in biopsies measured relative to current standards of care, as calculated by DCA measuring the benefit of adopting different risk models for aiding the decision to biopsy patients who would otherwise be biopsied. The x-axis details the range of accepted risk a clinician or patient may accept before deciding to biopsy. Panels show the percentage reduction in biopsies based upon  the detection of varying levels of disease severity: **A** - any cancer , **B** -  Gleason ≥ 3+4 and **C** - Gleason ≥ 4+3. Coloured lines show differing comparator models; **Blue**- biopsy all patients with a PSA >3 ng/mL, **Green** - biopsy patients based on the  MassSpec model, **Purple** - biopsy patients based on the ExoRNA model, **Red** - biopsy patients based on a the ExoSpec model. To assess the benefit of adopting these risk models in a non-PSA screened population we used data available from the control arm of the CAP study [@Martin2018].  DCA curves were calculated from 1,000 bootstrap resamples of the available data to match the distribution of disease reported in the CAP trial population. Mean sNB from these resampled DCA results were calculated and the SoC model results used as the baseline benefit. Results are plotted relative to this SoC benefit. See Methods for full details._
