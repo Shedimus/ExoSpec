@@ -4,8 +4,7 @@ author: "Shea P. Connell"
 date: "`r format(Sys.time(), '%B %Y')`"
 output: word_document
 ---
-
-```{r setup, include=FALSE, message=FALSE}
+```{r Setup and Data, include=FALSE, message=FALSE}
 # Always set the random seed, even if you don't think you need it (this work definitely does!). Please note that these analyses were originally
 # performed in R Version 3.5.3 and a change was made to the sampling function in 3.6, making these results no longer
 # quantitatively reproducible. So I have added a catch to "reset" the RNG to the "old" rounding version if this
@@ -169,7 +168,7 @@ Non_Cancer_Peptides <- MassSpec %>%
 
 #Now reduce the original MassSpec dataset to the above subsets:
 MassSpec <- MassSpec %>% 
-   select(Sample_ID, Cancer_Peptides, Non_Cancer_Peptides) %>% 
+   select(Sample_ID, unique(c(Cancer_Peptides, Non_Cancer_Peptides))) %>% 
    inner_join(ClinData, by = "Sample_ID")
 
 ########### NANOSTRING DATA LOAD ############
@@ -181,7 +180,20 @@ NanoString <- read_csv(here("data/raw/Nano167_Log2Pos_Norm.csv"),
                        )) %>% 
    rename("ERG3 exons 4-5" = "ERG 3 ex 4-5",
           "ERG3 exons 6-7" = "ERG3 ex 6-7",
-          TIMP4 = "Timp4")
+          TIMP4 = "Timp4") 
+
+# #Going to pre-filter some low-variance genes:
+# NanoStringLowVar <- NanoString %>% 
+#    select(-Sample_ID) %>% 
+#    map_dbl(var) %>% 
+#    as.data.frame() %>% 
+#    rownames_to_column("Gene") %>% 
+#    filter(. <= 2) %>% 
+#    .$Gene
+# 
+# NanoString <- NanoString %>% 
+#    select(-NanoStringLowVar)
+
 #Make the merged dataset that is used for the rest of the analyses:
 ExoSpec <- inner_join(NanoString, MassSpec, by = "Sample_ID") %>% 
    select(-BxDate, -UrineDate, -CAPRA) %>% 
@@ -193,14 +205,13 @@ ExoSpecMets <- inner_join(NanoString, MassSpec, by = "Sample_ID") %>%
    filter(Cat == "A" | PSA >= 100) 
 
 #Name the variables we will use for comparators later:
-NanoGenes <- names(NanoString)[1:167]
+NanoGenes <- NanoString %>% 
+   select(-Sample_ID) %>% 
+   names
 #Grab the names of all the peptides...
-Peptides <- c(Cancer_Peptides, Non_Cancer_Peptides)
+Peptides <- unique(c(Cancer_Peptides, Non_Cancer_Peptides))
 ```
-
-
-
-```{r Model constuction}
+```{r Model construction}
 # With all data loaded, cleaned and processed we can begin the analyses:
 ## Make a helper function to build the LASSO-based comparators
 LASSO_helper <- function(Variables, 
@@ -269,11 +280,8 @@ ConfirmedVariables <- map(AllModels, function(Comparator){
 # MetsPredictions <- predict(AllModels$ExoSpec$Model, 
 #                            newx = data.matrix(ExoSpecMets))
 ```
-
-
-
 ```{r RF attempts}
-#Can we "fix" the weird distributions by just flinging everything at a random forest with pre-selected features (bad practice)? 
+#Can we "fix" the weird distributions by just flinging everything at a random forest with pre-selected features (bad practice?) 
 RFModelHelper <- function(Variables,
                           Dataframe = ExoSpec,
                           # Use the continuous version of the TriSig label:
@@ -322,14 +330,42 @@ MetsPredictions <- predict(AllModels$ExoSpec$Model,
 
 # Introduction
 
-This is placeholder text for the introduction - depending on journal this may be considered copyrighted.
+This is placeholder text for the introduction that can be added to the RMarkdown later on.
 
 # Methods 
 ### Patient population and characteristics
+
+The full Movember GAP1 Urine Biomarker Cohort comprises of 1,257 first-catch post-DRE, pre-TRUS biopsy urine samples collected between 2009 and 2015 from urology clinics at multiple sites. Samples within the Movember cohort that were analysed by both mass spectrometry and targetted transcriptomics were eligible for selection for model development in the current study (*n* = `r nrow(ExoSpec) + nrow(ExoSpecMets)`.
+
+Exclusion criteria for model development included a recent prostate biopsy or trans-urethral resection of the prostate (<6 weeks) and metastatic disease (confirmed by a positive bone-scan or PSA >100 ng/mL), resulting in a cohort of `r nrow(ExoSpec)` samples, deemed the ExoSpec cohort. The samples analysed in the ExoMeth cohort were collected from the Norfolk and Norwich University Hospital (NNUH, Norwich, UK). Sample collections and processing were ethically approved in by the East of England REC.
+
 ### Sample Processing and analysis
+
+Urine samples were processed according to the Movember GAP1 standard operating procedure (Supplementary Methods). 
+
+**MassSpec methods go here**. Peptide data were filtered *a priori* by only retaining peptides quantified at any level in at least 30% of either cancer or non-cancer samples.
+
+Cell-free RNA (cf-RNA) was isolated and quantified from urinary extracellular vesicles using NanoString technology, with 167 gene-probes (Supplementary Table 1), as described in Connell *et al* (2019), with the modification that NanoString data were normalised according to NanoString guidelines using NanoString internal positive controls, and log~2~  transformed. Clinical variables that were considered are serum PSA, age at sample collection, DRE impression and urine volume collected.
+
 ### Statistical Analysis
 
-*A priori* filtering of peptides was undertaken by only retaining peptides quantified in at least 30% of either cancer or non-cancer samples.
+All analyses, model construction and data preparation were undertaken in R version 3.5.3 [@RCoreTeam2019], and unless otherwise stated, utilised base R and default parameters. All data and code required to reproduce these analyses can be found at https://github.com/UEA-Cancer-Genetics-Lab/ExoSpec
+
+#### Feature Reduction 
+
+Following *a priori* filtering, the ExoSpec cohort had a total of `r length(c(NanoGenes, Peptides, ClinVars))` possible variables for modelling (cf-RNA (*n* = `r length(NanoGenes)`), methylation (*n* = `r length(Peptides)`) and clinical variables (*n* = `r length(ClinVars)`) and made feature selection a key task for minimising the potential for model overfit and increasing the robustness of any trained models. 
+
+Variables with a significant association with the modified Gleason label described below were robustly identified by means of a 20-fold cross-validated LASSO-penalised regression model, fit using the *glmnet* package [@glmnet]. 
+
+#### Comparator Models 
+
+To evaluate potential clinical utility, additional models were trained as comparators using subsets of the available variables across the patient population: a clinical standard of care (SoC) model was trained by incorporating age, PSA, T-staging and clinician DRE impression; a model using only the pre-filtered peptides (MassSpec, *n* = `r length(Peptides)`); and a model only using NanoString gene-probe information (NanoString, *n* = `r length(NanoGenes)`). The fully integrated ExoMeth model was trained by incorporating information from all of the above variables (*n* = `r length(c(NanoGenes, Peptides, ClinVars))`). Each set of variables for comparator models were independently selected via the cross-validated LASSO feature selection process described above to select the optimal subset of variables possible for each predictive model.
+
+#### Model Construction
+
+All models were trained via the random forest algorithm [@Breiman2001], using the *randomForest* package [@randomForest] with default parameters except for: resampling without replacement and 401 trees being grown per model. Risk scores from trained models are presented as the out-of-bag predictions; the aggregated outputs from decision trees within the forest where the sample in question has not been included within the resampled dataset [@Breiman2001]. Bootstrap resamples were identical for feature selection and model training for all models and used the same random seed.
+
+Models were trained on a modified continuous label, based by binning on biopsy outcome and constructed as follows: samples were binned on a continuous scale (range 0 – 1) according to Gleason score: where no evidence of cancer on biopsy are scored 0, patients with disease consisting mostly of Gleason 3 are equal to 0.5 and predominantly Gleason 4 (or 5) are assigned to 1. Treating this label as a continuous variable recognises that two patients with the same Gleason scored TRUS-biopsy detected cancer may not share the exact same proportions of tumour pattern, or overall disease burden within their prostate. This scale is solely used for model training and is not represented in any clinical endpoint measurements, or for determining predictive ability and clinical utility. 
 
 # Results
 
@@ -897,6 +933,7 @@ ggsave(
    height = 10, width = 13, units = "in",
    device = cairo_pdf
 )
+
 ```
 
 **Figure 4.** _Decision curve analysis (DCA) plots detailing the standardised net benefit (sNB) of adopting different risk models, relative to standard of care The x-axis details the range of risk a clinician, patient or interdisciplinary team may accept before deciding to undertake biopsy. Panels show the relative sNB based upon the detection of varying levels of disease severity: **A** - detection of any cancer , **B** - detection of Gleason ≥ 3+4, **C** - detection of Gleason ≥ 4+3; **Orange** - biopsy patients according to current standards of care, **Green** - biopsy patients based on the MassSpec model, **Purple** - biopsy patients based on the ExoRNA model, **Red** - biopsy patients based on a the ExoSpec model. To assess the benefit of adopting these risk models in a non-PSA screened population we used data available from the control arm of the CAP study [@Martin2018]. DCA curves were calculated from 1,000 bootstrap resamples of the available data to match the distribution of disease reported in the CAP trial population. Mean sNB from these resampled DCA results were calculated and the SoC model results used as the baseline benefit. Results are plotted relative to this SoC benefit. See Methods for full details._
