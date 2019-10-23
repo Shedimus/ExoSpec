@@ -347,7 +347,9 @@ Exclusion criteria for model development included a recent prostate biopsy or tr
 
 Urine samples were processed according to the Movember GAP1 standard operating procedure (Supplementary Methods). 
 
-**MassSpec methods go here**. Peptide data were filtered *a priori* by only retaining peptides quantified at any level in at least 30% of either cancer or non-cancer samples.
+**MassSpec methods to be inserted**. 
+
+Peptide data were filtered *a priori* by only retaining peptides quantified at any level in at least 30% of either cancer or non-cancer samples.
 
 Cell-free RNA (cf-RNA) was isolated and quantified from urinary extracellular vesicles using NanoString technology, with 167 gene-probes (Supplementary Table 1), as described in Connell *et al* (2019), with the modification that NanoString data were normalised according to NanoString guidelines using NanoString internal positive controls, and log~2~  transformed. Clinical variables that were considered are serum PSA, age at sample collection, DRE impression and urine volume collected.
 
@@ -420,26 +422,49 @@ ExoSpec %>%
    print(markup = "markdown", cnames = c("Biopsy Negative:", "Biopsy Positive"))
 ```
 
+### Feature selection and model development
 
+Using the 20-fold cross-validated LASSO applied to the data to identify input variables as described above, four Random Forest based comparator models were produced: a standard of care (SoC) model using only clinical information (age and PSA), a model using only peptide data from mass spectrometry (MassSpec, 13 peptides), a model using only cf-RNA information (ExoRNA, 6 gene-probes) and the integrated model, deemed ExoSpec (11 variables) (**Table 2**). The ExoSpec model is a multivariable risk prediction Random Forest model incorporating clinical, mass spectrometry and cf-RNA variables.
+
+In the SoC comparator model only PSA and age were selected as important predictors. Of the 13 peptides selected for input to the MassSpec model and the 11 cf-RNA, only four peptides and three cf-RNA probes were retained for the final ExoSpec model. Interestingly the ExoSpec model further incorporated an additional two peptides not deemed to be useful when only peptides were considered (e03608 and e05579, **Table 2**). 
+
+
+**Table 2.** *Features selected by the cross-validated LASSO to be used as input variables for each Random Forest comparator model*
 ```{r Features selected}
 
 # Map through the uneven list, adding blank rows to make it all even for a table:
 #We can play about with this as a table to make it nicer in Word...
+# SelectedFeatures <- map_dfc(ConfirmedVariables, function(variables) {
+#    
+#    rowsAdded = max(map_dbl(ConfirmedVariables, nrow)) - nrow(variables)
+#    
+#    NiceTable = tibble(
+#       Variables = c(variables$Vars, rep("", rowsAdded)),
+#       Coefficients = c(round(variables$Coef, 6), rep("", rowsAdded))
+#    )
+# }) 
+# 
+# 
+# colnames(SelectedFeatures) <- c("SoC Variables", "SoC Coefficients", 
+#                                 "MassSpec Variables", "MassSpec Coefficients",
+#                                 "ExoRNA Variables", "ExoRNA Coefficients", 
+#                                 "ExoSpec Variables", "ExoSpec Coefficients")
+
 SelectedFeatures <- map_dfc(ConfirmedVariables, function(variables) {
-   
+
    rowsAdded = max(map_dbl(ConfirmedVariables, nrow)) - nrow(variables)
-   
+
    NiceTable = tibble(
-      Variables = c(variables$Vars, rep("", rowsAdded)),
-      Coefficients = c(round(variables$Coef, 6), rep("", rowsAdded))
+      Variables = c(variables$Vars, rep("", rowsAdded))
    )
-}) 
+})
 
 
-colnames(SelectedFeatures) <- c("SoC Variables", "SoC Coefficients", 
-                                "MassSpec Variables", "MassSpec Coefficients",
-                                "ExoRNA Variables", "ExoRNA Coefficients", 
-                                "ExoSpec Variables", "ExoSpec Coefficients")
+colnames(SelectedFeatures) <- c("SoC",
+                                "MassSpec",
+                                "ExoRNA",
+                                "ExoSpec")
+
 
 format_table(SelectedFeatures, format = "markdown")
 ```
@@ -521,7 +546,7 @@ SoC_Misclassify <- AllModels[["SoC"]][["Results"]] %>%
 
 As ExoSpec Risk Score (range 0-1) increased, the likelihood of high-grade disease being detected on biopsy was significantly greater (`r OddsRatio`; ordinal logistic regression, **Figure 1**). 
 
-**Table 2.** *AUC of all trained models for detecting outcomes of an initial biopsy for varying clinically significant thresholds. Brackets show 95% confidence intervals of the AUC, calculated from 1,000 stratified bootstrap resamples. Input variables for each model are detailed in Table 1.*
+**Table 3.** *AUC of all trained models for detecting outcomes of an initial biopsy for varying clinically significant thresholds. Brackets show 95% confidence intervals of the AUC, calculated from 1,000 stratified bootstrap resamples. Input variables for each model are detailed in Table 1.*
 ```{r model AUCs}
 # Create another helper function that can grab the AUCs for a variety of (binary) outcomes@
 get_aucs <- function(ResultDF, RiskScore = "RiskScore",
