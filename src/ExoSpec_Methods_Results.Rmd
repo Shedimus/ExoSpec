@@ -2,7 +2,9 @@
 title: "ExoSpec Methods & Results"
 author: "Shea P. Connell"
 date: "`r format(Sys.time(), '%B %Y')`"
-output: word_document
+output:
+  word_document:
+    reference_docx: Format_Template.docx
 ---
 ```{r Setup and Data, include=FALSE, message=FALSE}
 # Always set the random seed, even if you don't think you need it (this work definitely does!). Please note that these analyses were originally
@@ -335,7 +337,7 @@ This is placeholder text for the introduction that can be added to the RMarkdown
 # Methods 
 ### Patient population and characteristics
 
-The full Movember GAP1 Urine Biomarker Cohort comprises of 1,257 first-catch post-DRE, pre-TRUS biopsy urine samples collected between 2009 and 2015 from urology clinics at multiple sites. Samples within the Movember cohort that were analysed by both mass spectrometry and targetted transcriptomics were eligible for selection for model development in the current study (*n* = `r nrow(ExoSpec) + nrow(ExoSpecMets)`.
+The full Movember GAP1 Urine Biomarker Cohort comprises of 1,257 first-catch post-DRE, pre-TRUS biopsy urine samples collected between 2009 and 2015 from urology clinics at multiple sites. Samples within the Movember cohort that were analysed by both mass spectrometry and targetted transcriptomics were eligible for selection for model development in the current study (*n* = `r nrow(ExoSpec) + nrow(ExoSpecMets)`).
 
 Exclusion criteria for model development included a recent prostate biopsy or trans-urethral resection of the prostate (<6 weeks) and metastatic disease (confirmed by a positive bone-scan or PSA >100 ng/mL), resulting in a cohort of `r nrow(ExoSpec)` samples, deemed the ExoSpec cohort. The samples analysed in the ExoMeth cohort were collected from the Norfolk and Norwich University Hospital (NNUH, Norwich, UK). Sample collections and processing were ethically approved in by the East of England REC.
 
@@ -351,11 +353,11 @@ Cell-free RNA (cf-RNA) was isolated and quantified from urinary extracellular ve
 
 All analyses, model construction and data preparation were undertaken in R version 3.5.3 [@RCoreTeam2019], and unless otherwise stated, utilised base R and default parameters. All data and code required to reproduce these analyses can be found at https://github.com/UEA-Cancer-Genetics-Lab/ExoSpec
 
-#### Feature Reduction 
+#### The LASSO 
 
-Following *a priori* filtering, the ExoSpec cohort had a total of `r length(c(NanoGenes, Peptides, ClinVars))` possible variables for modelling (cf-RNA (*n* = `r length(NanoGenes)`), methylation (*n* = `r length(Peptides)`) and clinical variables (*n* = `r length(ClinVars)`) and made feature selection a key task for minimising the potential for model overfit and increasing the robustness of any trained models. 
+Following *a priori* filtering, the ExoSpec cohort comprised a total of `r length(c(NanoGenes, Peptides, ClinVars))` possible variables for predictive modelling (cf-RNA (*n* = `r length(NanoGenes)`), methylation (*n* = `r length(Peptides)`) and clinical variables (*n* = `r length(ClinVars)`) and made feature selection a key task for minimising the potential for model overfit and increasing the robustness of any trained models. 
 
-Variables with a significant association with the modified Gleason label described below were robustly identified by means of a 20-fold cross-validated LASSO-penalised regression model, fit using the *glmnet* package [@glmnet]. 
+Variables with an association to the modified Gleason label described below were robustly identified by means of a 20-fold cross-validated LASSO (L1-penalised) regression model, fit using the *glmnet* package [@glmnet]. Features whose coefficients were not shrunk to zero by the LASSO penalty were considered to be important and were positively selected for use in further predictive models.
 
 #### Comparator Models 
 
@@ -367,7 +369,21 @@ All models were trained via the random forest algorithm [@Breiman2001], using th
 
 Models were trained on a modified continuous label, based by binning on biopsy outcome and constructed as follows: samples were binned on a continuous scale (range 0 – 1) according to Gleason score: where no evidence of cancer on biopsy are scored 0, patients with disease consisting mostly of Gleason 3 are equal to 0.5 and predominantly Gleason 4 (or 5) are assigned to 1. Treating this label as a continuous variable recognises that two patients with the same Gleason scored TRUS-biopsy detected cancer may not share the exact same proportions of tumour pattern, or overall disease burden within their prostate. This scale is solely used for model training and is not represented in any clinical endpoint measurements, or for determining predictive ability and clinical utility. 
 
+#### Statistical evaluation of model predictivity
+
+Area Under the Receiver-Operator Characteristic curve (AUC) metrics were produced using the  package [@pROC], with confidence intervals calculated via 1,000 stratified bootstrap resamples. Density plots of model risk scores, and all other plots were created using the *ggplot2* package [@ggplot2]. Cumming estimation plots and calculations were produced using the *dabestr* package [@Ho2019] and 1,000 bootstrap resamples were used to visualise robust effect size estimates of model predictions.
+
+Decision curve analysis (DCA) [@Vickers2006] examined the potential net benefit of using the developed risk-signatures in the clinic. Standardised net benefit (sNB) was calculated with the *rmda* package [@Brown2018] and presented throughout our decision curve analyses as it is a more directly interpretable metric compared to net benefit [@Kerr2016]. In order to ensure DCA was representative of a more general population, the prevalence of Gleason scores within the ExoMeth cohort were adjusted via bootstrap resampling to match those observed in a population of more than 219,000 men within the control arm of the Cluster Randomised Trial of PSA Testing for Prostate Cancer (CAP) Trial [@Martin2018b], as described in Connell *et al* (2019). Briefly, of the biopsied men within this CAP cohort, 23.6% were Gs 6, 8.7% Gs 7 and 7.1% Gs ≥8, with 60.6% of biopsies showing no evidence of cancer. These ratios were used to perform stratified bootstrap sampling with replacement of the Movember cohort to produce a “new” dataset of 197 samples with risk scores from each comparator model. sNB was then calculated for this resampled dataset, and the process repeated for a total of 1,000 resamples with replacement. The mean sNB for each risk score and the “treat-all” options over all iterations were used to produce the presented figures to account for variance in resampling. Net reduction in biopsies was calculated relative to the clinical Standard of Care model, as it is the best one decision model one could produced with the clinical data within this cohort as opposed to defaulting of undertaking biopsy in all patients with a PSA ≥ 4 ng/mL. With this considered, biopsy reduction was calculated as:
+
+$Biopsy_{Net Reduction} = (NB_{Model} - NB_{SoC}) \times \dfrac{1-Threshold}{Threshold}$  
+
+Where the decision threshold (*Threshold*) is determined by accepted patient/clinician risk [@Vickers2006]. For example, a clinician may accept up to a 25% perceived risk of significant cancer before recommending biopsy to a patient, equating to a decision threshold of 0.25.
+
+
 # Results
+### The ExoSpec development cohort
+
+Linked cf-RNA and proteomic data were available for `r nrow(ExoSpec)` patients within the Movember GAP1 cohort, all originating from the NNUH and forming the ExoSpec development cohort (Table 1). The proportion of Gleason ≥7 disease in the ExoMeth cohort was `r round(sum(ExoSpec$LowGSig == "Yes") / nrow(ExoSpec) * 100,)`%. 
 
 **Table 1.** *Characteristics of the ExoSpec development cohort.*
 ```{r Cohort characteristics, results='asis'}
@@ -383,7 +399,6 @@ ExoSpec %>%
                                                labels = c("Small, n (%)", "Medium, n (%)", "Large, n (%)", "Unknown, n (%)"),
                                                ordered = TRUE
       ),
-      # For some reason this doesn't actually order them in the final table...
       "Gleason Score:" = factor(case_when(
          Gleason == 0 ~ "0, n (%)",
          Gleason == 6 ~ "6, n (%)",
@@ -502,7 +517,7 @@ SoC_Misclassify <- AllModels[["SoC"]][["Results"]] %>%
    nrow(AllModels[["SoC"]][["Results"]] %>% filter(LowGSig == "No"))
 ```
 
-As ExoSpec Risk Score (range 0-1) increased, the likelihood of high-grade disease being detected on biopsy was significantly greater (`r OddsRatio`; ordinal logistic regression, **Figure 2**). 
+As ExoSpec Risk Score (range 0-1) increased, the likelihood of high-grade disease being detected on biopsy was significantly greater (`r OddsRatio`; ordinal logistic regression, **Figure 1**). 
 
 **Table 2.** *AUC of all trained models for detecting outcomes of an initial biopsy for varying clinically significant thresholds. Brackets show 95% confidence intervals of the AUC, calculated from 1,000 stratified bootstrap resamples. Input variables for each model are detailed in Table 1.*
 ```{r model AUCs}
@@ -594,7 +609,8 @@ GleaSigBoot <- roc.test(ExoSpecROCs[["GleaSig"]], SoCROCs[["GleaSig"]],
 
 ```
 
-ExoSpec was superior to the standard of care model for predicting Gleason ≥3+4, returning an AUC of `r str_replace(AUC_Table$ExoSpec[2], "\\(", "\\(95% CI: ")`, *p* = `r round(LowGBoot$p.value, 3)` but was not significantly better than standards of care in predicting Gleason ≥4+3 disease (`r str_replace(AUC_Table$ExoSpec[1], "\\(", "\\(95% CI: ")` *p* = `r round(GleaSigBoot$p.value, 3)`, **Table 3**).
+ExoSpec was superior to all comparator models in predicting both Gleason ≥3+4 and Gleason ≥4+3 disease, returning AUCs in excess of 0.8. (**Table 3**). When the detection (or exclusion) of any cancer on biopsy was considered, ExoSpec showed remarkable predictive ability, with an AUC = `r str_replace(AUC_Table$ExoSpec[3], "\\(", "\\(95% CI: ")`.
+
 
 ```{r Model Density plots, echo=FALSE,message=FALSE}
 # Make a decent helper function to plot out the predictions for a given model as a density:
@@ -642,6 +658,7 @@ GleasonModelPlots <- map2(AllModels,
                                       Gleason == 7 ~ "Gleason = 3+4",
                                       Gleason %in% c(7.5, 8, 9, 10) ~ "Gleason \u22654+3"),
                                    levels = c("NEC", "Gleason = 6", "Gleason = 3+4", "Gleason \u22654+3"),
+                                   labels = c("NEC & Raised PSA", "Gleason = 6", "Gleason = 3+4", "Gleason \u22654+3"),
                                    ordered = TRUE))
                              suppressMessages(Density_Plots(ModelResult$Results, 
                                                             RiskScore = "RiskScore", 
@@ -652,6 +669,7 @@ GleasonModelPlots <- map2(AllModels,
                           })
 ```
 
+When risk score distributions were explored, we confirmed that the SoC model broadly reflected the problems currently exhibited in the clinic. The SoC model was able to discriminate the lowest and highest risk patients with relative ease, but not accurately separate clinically significant Gleason 3+4 disease from Gleason 6, with the latter possessing a higher mean SoC risk score than the more indolent disease group (**Figure 2A**). Neither of the MassSpec or ExoRNA comparator models were capable of distinctly separating biopsy outcome groups from one another (**Figure 2 B & C**). The multimodal ExoSpec model displayed clear improvements when able to utilise information from the other three variable sources and showed remarkable utility in excluding a cancer finding on intitial biopsy (**Figure 2D**).
 
 ```{r DABEST Estimation Analysis}
 EstimationData <- suppressWarnings(
@@ -699,7 +717,7 @@ EstimationSummary <- EstimationData$result %>%
 
 ```
 
-Resampling of ExoSpec predictions via estimation plots allowed for comparisons of mean ExoSpec signatures between groups by 1,000 bias-corrected and accelerated bootstrap resamples (**Figure 4**). The mean ExoSpec differences between patients with no evidence of cancer on biopsy were: Gleason 6 = `r EstimationSummary$Text[2]`, Gleason 3+4 = `r EstimationSummary$Text[1]` and Gleason ≥4+3 = `r EstimationSummary$Text[3]`. Interestingly, patients with no evidence of cancer had a lower ExoSpec risk score (mean difference = `r EstimationSummary$Text[4]`) than those men with a raised PSA but negative for cancer on biopsy (**Supplementary Figure 5**).
+Resampling of ExoSpec predictions via estimation plots allowed for comparisons of mean ExoSpec signatures between groups by 1,000 bias-corrected and accelerated bootstrap resamples (**Figure 4**). The mean ExoSpec differences between patients with no evidence of cancer on biopsy were: Gleason 6 = `r EstimationSummary$Text[2]`, Gleason 3+4 = `r EstimationSummary$Text[1]` and Gleason ≥4+3 = `r EstimationSummary$Text[3]`. IInterestingly, patients with a raised PSA but negative for cancer on biopsy  had a higher ExoSpec risk score than those with no evidence of cancer (mean difference = `r EstimationSummary$Text[4]`). Raised PSA patients also exhibited a wider ExoSpec score distribution than other clinical categories, suggesting these patients may not form a homogenous molecular or biological group (**Figure 3**).
 
 ```{r DCA}
 # Set the parameters for resampling:
@@ -1065,3 +1083,8 @@ ggsave(
 ```
 
 **Figure 5.** _Net percentage reduction in biopsies measured relative to current standards of care, as calculated by DCA measuring the benefit of adopting different risk models for aiding the decision to biopsy patients who would otherwise be biopsied. The x-axis details the range of accepted risk a clinician or patient may accept before deciding to biopsy. Panels show the percentage reduction in biopsies based upon  the detection of varying levels of disease severity: **A** - any cancer , **B** -  Gleason ≥ 3+4 and **C** - Gleason ≥ 4+3. Coloured lines show differing comparator models; **Blue**- biopsy all patients with a PSA >3 ng/mL, **Green** - biopsy patients based on the  MassSpec model, **Purple** - biopsy patients based on the ExoRNA model, **Red** - biopsy patients based on a the ExoSpec model. To assess the benefit of adopting these risk models in a non-PSA screened population we used data available from the control arm of the CAP study [@Martin2018].  DCA curves were calculated from 1,000 bootstrap resamples of the available data to match the distribution of disease reported in the CAP trial population. Mean sNB from these resampled DCA results were calculated and the SoC model results used as the baseline benefit. Results are plotted relative to this SoC benefit. See Methods for full details._
+
+#####
+# Supplementary Material
+
+
