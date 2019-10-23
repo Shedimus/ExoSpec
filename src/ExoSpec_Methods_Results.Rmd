@@ -5,6 +5,8 @@ date: "`r format(Sys.time(), '%B %Y')`"
 output:
   word_document:
     reference_docx: Format_Template.docx
+bibliography: bibliography.bib
+csl: vancouver.csl
 ---
 ```{r Setup and Data, include=FALSE, message=FALSE}
 # Always set the random seed, even if you don't think you need it (this work definitely does!). Please note that these analyses were originally
@@ -357,7 +359,7 @@ All analyses, model construction and data preparation were undertaken in R versi
 
 Following *a priori* filtering, the ExoSpec cohort comprised a total of `r length(c(NanoGenes, Peptides, ClinVars))` possible variables for predictive modelling (cf-RNA (*n* = `r length(NanoGenes)`), methylation (*n* = `r length(Peptides)`) and clinical variables (*n* = `r length(ClinVars)`) and made feature selection a key task for minimising the potential for model overfit and increasing the robustness of any trained models. 
 
-Variables with an association to the modified Gleason label described below were robustly identified by means of a 20-fold cross-validated LASSO (L1-penalised) regression model, fit using the *glmnet* package [@glmnet]. Features whose coefficients were not shrunk to zero by the LASSO penalty were considered to be important and were positively selected for use in further predictive models.
+Variables with an association to the modified Gleason label described below were robustly identified by means of a 20-fold cross-validated LASSO (L1-penalised) regression model, fit using the *glmnet* package [@Friedman2010]. Features whose coefficients were not shrunk to zero by the LASSO penalty were considered to be important and were positively selected for use in further predictive models.
 
 #### Comparator Models 
 
@@ -834,47 +836,49 @@ DCA_Plot_Data <- map(DCA_Results, function(outcome) {
 })
 
 DCA_SoC_Relative <- map(DCA_Plot_Data, function(OutcomeDCA){
-   OutcomeDCA %>% 
-      pivot_wider(names_from = Comparator,
-                  values_from = Net_Benefit) %>% 
-      mutate(MassSpec = MassSpec - SoC,
-             ExoRNA = ExoRNA - SoC,
-             ExoSpec = ExoSpec - SoC) %>% 
-      select(-SoC, -All) %>% 
-      pivot_longer(cols = None:ExoSpec,
-                   names_to = "Comparator",
-                   values_to = "Net_Benefit") %>% 
-      mutate(Comparator = factor(Comparator, 
-                                 levels = c("None", "MassSpec", "ExoRNA", "ExoSpec"),
-                                 ordered = TRUE))
+      OutcomeDCA %>% 
+            pivot_wider(names_from = Comparator,
+                        values_from = Net_Benefit) %>% 
+            mutate(MassSpec = MassSpec - SoC,
+                   ExoRNA   = ExoRNA - SoC,
+                   ExoSpec  = ExoSpec - SoC,
+                   All = All - SoC) %>% 
+            select(-SoC) %>% 
+            pivot_longer(cols = All:ExoSpec,
+                         names_to = "Comparator",
+                         values_to = "Net_Benefit") %>% 
+            mutate(Comparator = factor(Comparator, 
+                                       levels = c("All", "None", "MassSpec", "ExoRNA", "ExoSpec"),
+                                       ordered = TRUE))
 })
 
 DCAPlots <- map2(
-   DCA_SoC_Relative, c("any prostate cancer",
-                       "Gleason \u22653+4",
-                       "Gleason \u22654+3"),
-   function(outcome, outcome_name) {
-      ggplot(outcome, aes(x = Threshold, colour = Comparator, y = Net_Benefit)) +
-         geom_line(size = 1.07) +
-         theme_cowplot() +
-         coord_cartesian(ylim = c(-0.05, 0.5), xlim = c(0, 0.6)) +
-         labs(x = paste0("Decision threshold for detection of ", outcome_name),
-              y = "Standardised Net Benefit\nrelative to Standard of Care",
-              colour = "Comparators") +
-         scale_color_manual(values = c(D3Orange, D3Green, D3Purp, D3Red),
-                            labels = c("Standard of Care", "MassSpec", "ExoRNA", "ExoSpec")) +
-         theme(
-            legend.text = element_text(size = 24),
-            legend.title = element_text(size = 24),
-            legend.justification = "center"
-         ) +
-         guides(colour = guide_legend(
-            override.aes = list(size = 6),
-            keyheight = 0.5,
-            keywidth = 0.1,
-            default.unit = "inch"
-         ))
-   }
+      DCA_SoC_Relative, c("any prostate cancer",
+                          "Gleason \u22653+4",
+                          "Gleason \u22654+3"),
+      function(outcome, outcome_name) {
+            ggplot(outcome, aes(x = Threshold, colour = Comparator, y = Net_Benefit)) +
+                  geom_line(size = 1.07) +
+                  theme_cowplot() +
+                  coord_cartesian(ylim = c(-0.15, 0.5), xlim = c(0, 0.6)) +
+                  scale_y_continuous(breaks = seq(-0.1, 0.5, 0.1)) +
+                  labs(x = paste0("Decision threshold for detection of ", outcome_name),
+                       y = "Standardised Net Benefit\nrelative to Standard of Care",
+                       colour = "Comparators") +
+                  scale_color_manual(values = c(D3Blue, D3Orange, D3Green, D3Purp, D3Red),
+                                     labels = c("Treat all PSA >4 ng/mL", "Standard of Care", "MassSpec", "ExoRNA", "ExoSpec")) +
+                  theme(
+                        legend.text = element_text(size = 24),
+                        legend.title = element_text(size = 24),
+                        legend.justification = "center"
+                  ) +
+                  guides(colour = guide_legend(
+                        override.aes = list(size = 6),
+                        keyheight = 0.5,
+                        keywidth = 0.1,
+                        default.unit = "inch"
+                  ))
+      }
 )
 DCAPlots <- list(DCAPlots[[1]] + theme(legend.position = "none"),
                  DCAPlots[[2]] + theme(legend.position = "none"),
@@ -882,6 +886,9 @@ DCAPlots <- list(DCAPlots[[1]] + theme(legend.position = "none"),
                  Legend = get_legend(DCAPlots[[1]])
 )
 ```
+
+Decision curve analysis examined the net benefit of adopting ExoSpec in a population of patients suspected to harbour prostate cancer, with a PSA threshold of 4 ng/mL, suitable to trigger biopsy by current clinical guidelines [@NICE2019]. Using the SoC model as the baseline with which to compare ExoSpec to we found that the biopsy of men based upon their ExoSpec risk score consistently provided a net benefit across all decision thresholds and endpoints examined and was the only comparator model not apparently harmful at some threshold when compared to the SoC model (**Figure 4**). The ExoSpec model again showed a synergistic ability to rule out disease on an initial biopsy, greater than each of the comparator models in isolation (**Figure 4A**). Again, when compared to the SoC model, ExoSpec could result in a reduction in unnecessary biopsies by more than 30% for detecting clinically signficant (Gs ≥ 7) disease across a range of reasonable decision thresholds (**Figure 5**).
+
 
 # Figures 
 ```{r Waterfall_plot, fig.height=6, fig.width=9}
@@ -1084,7 +1091,5 @@ ggsave(
 
 **Figure 5.** _Net percentage reduction in biopsies measured relative to current standards of care, as calculated by DCA measuring the benefit of adopting different risk models for aiding the decision to biopsy patients who would otherwise be biopsied. The x-axis details the range of accepted risk a clinician or patient may accept before deciding to biopsy. Panels show the percentage reduction in biopsies based upon  the detection of varying levels of disease severity: **A** - any cancer , **B** -  Gleason ≥ 3+4 and **C** - Gleason ≥ 4+3. Coloured lines show differing comparator models; **Blue**- biopsy all patients with a PSA >3 ng/mL, **Green** - biopsy patients based on the  MassSpec model, **Purple** - biopsy patients based on the ExoRNA model, **Red** - biopsy patients based on a the ExoSpec model. To assess the benefit of adopting these risk models in a non-PSA screened population we used data available from the control arm of the CAP study [@Martin2018].  DCA curves were calculated from 1,000 bootstrap resamples of the available data to match the distribution of disease reported in the CAP trial population. Mean sNB from these resampled DCA results were calculated and the SoC model results used as the baseline benefit. Results are plotted relative to this SoC benefit. See Methods for full details._
 
-#####
-# Supplementary Material
 
 
