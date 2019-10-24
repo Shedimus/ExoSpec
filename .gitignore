@@ -38,3 +38,6 @@ rsconnect/
 
 # Sensitive data that maybe shouldn't be online
 data/
+
+# Manually edited files
+docs/ExoSpec_Methods_Results(*
