@@ -1117,3 +1117,16 @@ ggsave(
 
 
 
+```{r Little stats}
+# Requested stats for Table 1 p values...
+smolstats <- ExoSpec %>% 
+      select(is_C, Age, PSA) 
+
+wilcox.test(smolstats %>% filter(is_C == "Yes") %>% pull(Age),
+            smolstats %>% filter(is_C == "No") %>% pull(Age))
+
+wilcox.test(smolstats %>% filter(is_C == "Yes") %>% pull(PSA),
+            smolstats %>% filter(is_C == "No") %>% pull(PSA))
+
+
+```
