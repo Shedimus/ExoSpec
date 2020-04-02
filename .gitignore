@@ -37,7 +37,7 @@ vignettes/*.pdf
 rsconnect/
 
 # Sensitive data that maybe shouldn't be online
-data/
+data/CENSORED/
 
 # Manually edited files
 docs/ExoSpec_Methods_Results(*
