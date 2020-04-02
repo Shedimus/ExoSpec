@@ -29,7 +29,6 @@ knitr::opts_chunk$set(
 library(readxl)
 library(tidyverse)
 library(magrittr)
-library(ssh)
 library(here)
 
 #Modelling & Computation
@@ -62,81 +61,9 @@ D3Blue <- "#1F77B4FF"
 D3Green <- "#2CA02CFF"
 D3Purp <- "#9467BDFF"
 
-#### DOWNLOAD DATADUMPS  ####
-# The database is dumped daily to the cancer genetics HPC drive so here we ssh into the UEA HPC. 
-# Only UEA samples in the Mass Spec data so we don't need to worry about cleaning the nightmare that is non-UEA data...
-HPC <- ssh_connect("xjz17vzu@hpc.uea.ac.uk") 
-#Download the UEA files to the local path
-scp_download(HPC,
-             "/gpfs/afm/cancergenetics/Datasets/lab_database_dumps/UEA_Lab_full_Datadump_latest.xlsx",
-             here("data/raw/"),
-             verbose = FALSE)
-ssh_disconnect(HPC)
-#### Read in and clean Clinical data 
-ClinData <- read_xlsx(here("data/raw/UEA_Lab_full_Datadump_latest.xlsx"),
-                      sheet = "clin_samples_closest_biopsy", 
-                      guess_max = 2000) %>% 
-   #Pull out the clinical variables we care about
-   select(in_house_sample_ID, 
-          category_at_initial_urine_collection, 
-          subcategory_at_initial_urine_collection,
-          age_at_enrollment, 
-          PSA_at_initial_urine_collection,
-          total_gleason_predominantly, 
-          total_gleason_less_predominantly,
-          clinical_t_at_enrollment, 
-          CAPRA_Score,
-          urine_vol_ml, 
-          DRE_size,
-          date_of_initial_urine_collection, 
-          date_of_biopsy) %>% 
-   #Rename them to be easier to work with
-   set_colnames(c("Sample_ID", 
-                  "Cat", "SubCat", 
-                  "Age", "PSA", 
-                  "MajGleason", "MinGleason",
-                  "TStage", "CAPRA",
-                  "UrineVol", "DRESize", 
-                  "UrineDate", "BxDate")) %>% 
-   #Mutate the categories and Gleasons to play nicely:
-   mutate(
-      #Change up all the high-PSA sub-types to just be a -ve Bx outcome:
-      Cat = case_when(
-         Cat == "abnormal" ~ "S",
-         SubCat %in% c("atypia","P", "S", "HG-P", "unknown") ~ "S",
-         TRUE ~ Cat),
-      #Mutate Gleason to something a bit more workable
-      Gleason = case_when(
-         MajGleason == 4 & MinGleason == 3 ~ 7.5,
-         Cat == "A" ~ 11,
-         Cat %in% c("CB", "S") ~ 0,
-         Cat == "Sx" ~ NA_real_,
-         TRUE ~ MajGleason + MinGleason),
-      #Create dates for Urine collection
-      UrineDate = lubridate::as_date(UrineDate),
-      #IMpute missing Urine volumes
-      UrineVol = if_else(is.na(UrineVol), median(UrineVol, na.rm = TRUE), UrineVol)
-   ) %>%  
-   #Remove the Major/minor gleasons
-   select(-MajGleason, - MinGleason) %>% 
-   #Create the outcomes:
-   mutate(TriSig = factor(case_when(Gleason == 0 ~ "NEC",
-                                    Gleason <= 7 ~ "LC",
-                                    Gleason >= 7.5 ~ "HC",
-                                    is.na(Gleason) & Cat == "S" ~ "NEC",
-                                    TRUE ~ "Problemo"),
-                          levels = c("NEC", "LC", "HC"),
-                          ordered = TRUE),
-          GleaSig = factor(if_else(Gleason >= 7.5, 1, 0), labels = c("No", "Yes")),
-          LowGSig = factor(if_else(Gleason >= 7, 1, 0), labels = c("No", "Yes")),
-          ClinSig = factor(if_else(Cat %in% c("I", "H", "A"), 1, 0), labels = c("No", "Yes")),
-          is_C    = factor(if_else(Cat %in% c("CB", "S"), 0, 1), labels = c("No", "Yes")),
-          is_HC   = factor(if_else(Cat %in% c("H", "A"), 1, 0), labels = c("No", "Yes")),
-          Gleason = factor(Gleason, ordered = TRUE)
-   ) %>% 
-   # Sample_ID M_88_2 has an abnormally high PSA closest to time of collection (63.8) due to an infection
-   # Instead we will impute the post-infection value of 4.1.
-   mutate(PSA = if_else(Sample_ID == "M_88_2", 4.1, PSA))
+#### LOAD DATA ####
+ExoSpec <- readRDS(here("output/data_out/ExoSpec_Cohort.RDS"))
+ExoSpecMets <- readRDS(here("data/ExoMeth_Mets.RDS"))
 
 #Define the variables used throughout:
 # The outcomes assessed later on (see data dictionary for formal definition):
@@ -144,77 +71,20 @@ outcomes <- c("Cat", "TriSig", "GleaSig", "LowGSig", "ClinSig","is_C")
 # Clinical Variables:
 ClinVars <- c("PSA", "UrineVol", "DRESize", "Age")
 
-########### MASS SPEC DATA LOAD ############
-#Load the RDS object (quicker than csv) of the pre-cleaned MassSpec data
-MassSpec <- readRDS(here("output/data_out/MassSpecClean.RDS"))
-
-# We need to set a lower bounds on the number of samples a peptide is quantified in because information cannot be reliably 
-# obtained from a peptide if it is only quantified in <30% of samples. This is a standard approach.
-UniqueValues <- function(peptide) {
-   n_distinct(peptide) > (340 * 0.3)
-}
-
-#Pull out the peptides quantified in _at least_ 30% of Cancer samples:
-Cancer_Peptides <- MassSpec %>% 
-   filter(is_C == "Yes") %>% 
-   select(-outcomes, -ClinVars, -UrineDate, -BxDate, -Sample_ID) %>% 
-   #Remove probes that are quantified in <30% of samples
-   select_if(UniqueValues) %>% 
-   names
-
-#Pull out the peptides quantified in _at least_ 30% of Non-Cancer samples:
-Non_Cancer_Peptides <- MassSpec %>% 
-   filter(is_C == "No") %>% 
-   select(-outcomes, -ClinVars, -UrineDate, -BxDate, -Sample_ID) %>% 
-   #Remove probes that are quantified in <30% of samples
-   select_if(UniqueValues) %>% 
-   names
-
-#Now reduce the original MassSpec dataset to the above subsets:
-MassSpec <- MassSpec %>% 
-   select(Sample_ID, unique(c(Cancer_Peptides, Non_Cancer_Peptides))) %>% 
-   inner_join(ClinData, by = "Sample_ID")
-
-########### NANOSTRING DATA LOAD ############
-NanoString <- read_csv(here("data/raw/Nano167_Log2Pos_Norm.csv"),
-                       col_names = TRUE,
-                       col_types = cols(
-                          .default = col_double(),
-                          Sample_ID = col_character()
-                       )) %>% 
-   rename("ERG3 exons 4-5" = "ERG 3 ex 4-5",
-          "ERG3 exons 6-7" = "ERG3 ex 6-7",
-          TIMP4 = "Timp4") 
-
-# #Going to pre-filter some low-variance genes:
-# NanoStringLowVar <- NanoString %>% 
-#    select(-Sample_ID) %>% 
-#    map_dbl(var) %>% 
-#    as.data.frame() %>% 
-#    rownames_to_column("Gene") %>% 
-#    filter(. <= 2) %>% 
-#    .$Gene
-# 
-# NanoString <- NanoString %>% 
-#    select(-NanoStringLowVar)
-
-#Make the merged dataset that is used for the rest of the analyses:
-ExoSpec <- inner_join(NanoString, MassSpec, by = "Sample_ID") %>% 
-   select(-BxDate, -UrineDate, -CAPRA) %>% 
-   filter(Cat != "A") %>% 
-   filter(PSA < 100) 
-
-ExoSpecMets <- inner_join(NanoString, MassSpec, by = "Sample_ID") %>% 
-   select(-BxDate, -UrineDate, -CAPRA) %>% 
-   filter(Cat == "A" | PSA >= 100) 
 
 #Name the variables we will use for comparators later:
-NanoGenes <- NanoString %>% 
-   select(-Sample_ID) %>% 
+NanoGenes <- ExoSpec %>% 
+   select(-Sample_ID, -Gleason,
+          -starts_with("e", ignore.case = FALSE), 
+          -all_of(outcomes), -all_of(ClinVars)) %>% 
    names
-#Grab the names of all the peptides...
-Peptides <- unique(c(Cancer_Peptides, Non_Cancer_Peptides))
+
+#Grab the names of all the peptides, they all start with lowercase "e" so relatively easy
+Peptides <- ExoSpec %>% 
+   select(starts_with("e", ignore.case = FALSE)) %>% 
+   names
 ```
+
 ```{r Model construction}
 # With all data loaded, cleaned and processed we can begin the analyses:
 ## Make a helper function to build the LASSO-based comparators
@@ -276,16 +146,10 @@ ConfirmedVariables <- map(AllModels, function(Comparator){
    Comparator$Coefs %>% 
       as.data.frame()
 })
-
-# ExoSpecMets <- ExoSpecMets %>%
-#    select(-Sample_ID, -Cat, -SubCat, -TStage, -DRESize) %>% 
-#    select(ConfirmedVariables$ExoSpec$Vars)
-# 
-# MetsPredictions <- predict(AllModels$ExoSpec$Model, 
-#                            newx = data.matrix(ExoSpecMets))
 ```
-```{r RF attempts}
-#Can we "fix" the weird distributions by just flinging everything at a random forest with pre-selected features (bad practice?) 
+
+```{r RF Models}
+# Using the LASSO-selected features, fit Random Forest models to the datasets:
 RFModelHelper <- function(Variables,
                           Dataframe = ExoSpec,
                           # Use the continuous version of the TriSig label:
@@ -318,23 +182,22 @@ RFModelHelper <- function(Variables,
       Results = results
    ))
 }
+
 #### Train each comparator models ####
 # Map through each of the comparator choices and produce a model.
 AllModels <- map(ConfirmedVariables, function(comparator){
    RFModelHelper(Variables = comparator$Vars)}) %>%
    set_names(c("SoC", "MassSpec", "ExoRNA", "ExoSpec"))
 
+
 ExoSpecMets <- ExoSpecMets %>%
-   select(-Sample_ID, -Cat, -SubCat, -TStage, -DRESize) %>%
+   select(-Sample_ID, -Cat, -DRESize) %>%
    select(ConfirmedVariables$ExoSpec$Vars)
 
+#Produce the "positive control" predictions from the Mets samples
 MetsPredictions <- predict(AllModels$ExoSpec$Model,
                            newdata = ExoSpecMets[, ConfirmedVariables$ExoSpec$Vars])
 ```
-
-# Introduction
-
-This is placeholder text for the introduction that can be added to the RMarkdown later on.
 
 # Methods 
 ### Patient population and characteristics
@@ -1128,5 +991,27 @@ wilcox.test(smolstats %>% filter(is_C == "Yes") %>% pull(Age),
 wilcox.test(smolstats %>% filter(is_C == "Yes") %>% pull(PSA),
             smolstats %>% filter(is_C == "No") %>% pull(PSA))
 
+#Calculate the fold changes between cancer and non-cancer patients the variables:
+EveryVar <- bind_rows(ConfirmedVariables) %>% 
+   pull(Vars) %>% 
+   unique()
 
+LowGsig_FoldChange <- ExoSpec %>% 
+   select(LowGSig, all_of(EveryVar)) %>% 
+   group_by(LowGSig) %>% 
+   summarise_all(mean) %>% 
+   pivot_longer(all_of(EveryVar), names_to = "Variable", values_to = "Count") %>% 
+   pivot_wider(names_from = LowGSig, values_from = Count) %>% 
+   mutate('Change from No' = Yes - No)
+
+Cancer_Fold_Change <- ExoSpec %>% 
+   select(is_C, all_of(EveryVar)) %>% 
+   group_by(is_C) %>% 
+   summarise_all(mean) %>% 
+   pivot_longer(all_of(EveryVar), names_to = "Variable", values_to = "Count") %>% 
+   pivot_wider(names_from = is_C, values_from = Count) %>% 
+   mutate('Change from No' = Yes - No)
+
+write_csv(LowGsig_FoldChange, "output/data_out/LowGleasonFoldChanges.csv")
+write_csv(Cancer_Fold_Change, "output/data_out/CancerFoldChanges.csv")
 ```
