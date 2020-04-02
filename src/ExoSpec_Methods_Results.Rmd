@@ -62,7 +62,7 @@ D3Green <- "#2CA02CFF"
 D3Purp <- "#9467BDFF"
 
 #### LOAD DATA ####
-ExoSpec <- readRDS(here("output/data_out/ExoSpec_Cohort.RDS"))
+ExoSpec <- readRDS(here("data/ExoSpec_Cohort.RDS"))
 ExoSpecMets <- readRDS(here("data/ExoMeth_Mets.RDS"))
 
 #Define the variables used throughout:
@@ -996,13 +996,13 @@ EveryVar <- bind_rows(ConfirmedVariables) %>%
    pull(Vars) %>% 
    unique()
 
-LowGsig_FoldChange <- ExoSpec %>% 
-   select(LowGSig, all_of(EveryVar)) %>% 
-   group_by(LowGSig) %>% 
-   summarise_all(mean) %>% 
-   pivot_longer(all_of(EveryVar), names_to = "Variable", values_to = "Count") %>% 
-   pivot_wider(names_from = LowGSig, values_from = Count) %>% 
-   mutate('Change from No' = Yes - No)
+# LowGsig_FoldChange <- ExoSpec %>% 
+#    select(LowGSig, all_of(EveryVar)) %>% 
+#    group_by(LowGSig) %>% 
+#    summarise_all(mean) %>% 
+#    pivot_longer(all_of(EveryVar), names_to = "Variable", values_to = "Count") %>% 
+#    pivot_wider(names_from = LowGSig, values_from = Count) %>% 
+#    mutate('Change from No' = Yes - No)
 
 Cancer_Fold_Change <- ExoSpec %>% 
    select(is_C, all_of(EveryVar)) %>% 
@@ -1012,6 +1012,6 @@ Cancer_Fold_Change <- ExoSpec %>%
    pivot_wider(names_from = is_C, values_from = Count) %>% 
    mutate('Change from No' = Yes - No)
 
-write_csv(LowGsig_FoldChange, "output/data_out/LowGleasonFoldChanges.csv")
+# write_csv(LowGsig_FoldChange, "output/data_out/LowGleasonFoldChanges.csv")
 write_csv(Cancer_Fold_Change, "output/data_out/CancerFoldChanges.csv")
 ```
