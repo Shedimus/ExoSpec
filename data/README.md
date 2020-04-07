@@ -1,1 +1,1 @@
-Here you'll store your raw data files. If they are encoded in a supported file format, they'll automatically be loaded when you call `load.project()`.
+The R formatted datasets are contained in this folder for easy reading directly into R, where all variables are correctly formatted - factors _remain_ factors and levels are retained.
