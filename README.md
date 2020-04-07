@@ -1,4 +1,4 @@
-# ExoSpexc
+# ExoSpec
 
 This repository is an accompaniment to the ExoSpec manuscript published in _to be confirmed_, titled 
 _"Detecting clinically significant prostate cancer with urine: a multivariable risk model integrating urinary proteomic and cell-free RNA data"_. 
