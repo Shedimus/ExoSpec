@@ -36,8 +36,8 @@ vignettes/*.pdf
 # Shiny token, see https://shiny.rstudio.com/articles/shinyapps.html
 rsconnect/
 
-# Sensitive data that maybe shouldn't be online
+# Sensitive data that can't be shared
 data/CENSORED/
 
-# Manually edited files
+# Manually edited files & drafts
 docs/ExoSpec_Methods_Results(*
