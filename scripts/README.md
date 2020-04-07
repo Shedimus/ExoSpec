@@ -1,1 +1,1 @@
-This is where smaller functions and analyses are stored alongside the work-in-progress full analysis script.
+This is where the function to render the manuscript lives.
